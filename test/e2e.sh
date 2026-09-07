@@ -292,7 +292,7 @@ t_cold_restart_preserves_set() {
   log "t_cold_restart_preserves_set (reuses the running trio)"
   set_is_fully_online mongo-2 || { bad "no set to cold-restart"; return; }
 
-  docker stop mongo-1 mongo-2 mongo-3 >/dev/null
+  docker stop -t 60 mongo-1 mongo-2 mongo-3 >/dev/null
   log "all nodes stopped; starting them back up"
   docker start mongo-1 mongo-2 mongo-3 >/dev/null
 
@@ -489,7 +489,9 @@ t_sigterm_primary_demotes_before_exit() {
 
   local primary
   primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)"
-  docker stop "$primary" >/dev/null   # SIGTERM, then the restart policy is off for a stopped container
+  # -t 60: docker's default 10s grace would SIGKILL the wrapper mid-step-down
+  # (catch-up window 10s + mongod's own shutdown).
+  docker stop -t 60 "$primary" >/dev/null
   if node_logged "$primary" "stepping down before shutdown"; then
     ok "primary stepped down on SIGTERM"
   else
