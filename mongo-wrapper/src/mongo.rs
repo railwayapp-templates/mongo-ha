@@ -67,6 +67,34 @@ pub struct RsMember {
     pub state_str: String,
     pub healthy: bool,
     pub is_self: bool,
+    /// Seconds since the Unix epoch of this member's last applied optime
+    /// (`optime.ts`, the BSON Timestamp every member reports — not the
+    /// human-readable `optimeDate`, so lag arithmetic stays in the same
+    /// integer-seconds unit `Mongo::oplog_window` reads off the oplog itself).
+    /// None when the member has not applied anything yet (freshly added,
+    /// still in initial sync) or the server does not report it.
+    pub optime_secs: Option<u32>,
+}
+
+/// Parse one `replSetGetStatus` `members[]` row. Split out from `rs_status`
+/// so the shape can be fed synthetic BSON documents in tests — see
+/// `replication_monitor`'s derivation tests, which build members this way
+/// rather than requiring a live replica set.
+fn member_from_doc(m: &Document) -> RsMember {
+    RsMember {
+        id: bson_int(m.get("_id")).unwrap_or(-1),
+        host: m.get_str("name").unwrap_or("").to_string(),
+        state: bson_int(m.get("state")).unwrap_or(-1) as i32,
+        state_str: m.get_str("stateStr").unwrap_or("").to_string(),
+        healthy: m.get_f64("health").map(|h| h >= 1.0).unwrap_or(false)
+            || bson_int(m.get("health")).map(|h| h >= 1).unwrap_or(false),
+        is_self: m.get_bool("self").unwrap_or(false),
+        optime_secs: m
+            .get_document("optime")
+            .ok()
+            .and_then(|d| d.get_timestamp("ts").ok())
+            .map(|ts| ts.time),
+    }
 }
 
 /// The node's replica set status, or the fact that it has none.
@@ -293,15 +321,7 @@ impl Mongo {
                     .map(|arr| {
                         arr.iter()
                             .filter_map(Bson::as_document)
-                            .map(|m| RsMember {
-                                id: bson_int(m.get("_id")).unwrap_or(-1),
-                                host: m.get_str("name").unwrap_or("").to_string(),
-                                state: bson_int(m.get("state")).unwrap_or(-1) as i32,
-                                state_str: m.get_str("stateStr").unwrap_or("").to_string(),
-                                healthy: m.get_f64("health").map(|h| h >= 1.0).unwrap_or(false)
-                                    || bson_int(m.get("health")).map(|h| h >= 1).unwrap_or(false),
-                                is_self: m.get_bool("self").unwrap_or(false),
-                            })
+                            .map(member_from_doc)
                             .collect()
                     })
                     .unwrap_or_default();
@@ -333,6 +353,55 @@ impl Mongo {
         d.get_document("config")
             .cloned()
             .context("replSetGetConfig answered without a config")
+    }
+
+    /// This node's own oplog window: the wall-clock span, in whole seconds,
+    /// between the oldest and newest entries in `local.oplog.rs` right now —
+    /// the same computation the shell's `db.getReplicationInfo()` runs
+    /// (oldest/newest by `$natural` order, diffed). `None` when the oplog is
+    /// empty (a member that has taken no writes yet, or one whose oplog was
+    /// just created) rather than an error: an empty oplog is not a read
+    /// failure.
+    ///
+    /// A raw collection read, not an admin command, because there is no
+    /// `replSetGetStatus`-style command for this — the shell helper itself
+    /// queries the collection directly. Reads `local` the same way
+    /// `drop_stale_replset_config`'s count already does: the `root` role
+    /// includes the built-in `backup` role, which is granted read access to
+    /// `local.oplog.rs` specifically (backups need it), so no extra
+    /// privilege is required here.
+    pub async fn oplog_window(&self) -> Result<Option<Duration>> {
+        let client = self.client.read().await.clone();
+        let oplog = client.database("local").collection::<Document>("oplog.rs");
+        let first = tokio::time::timeout(
+            SHORT_COMMAND_TIMEOUT,
+            oplog.find_one(doc! {}).sort(doc! { "$natural": 1 }),
+        )
+        .await
+        .map_err(|_| anyhow!("reading the oldest oplog entry timed out"))?
+        .context("reading the oldest oplog entry failed")?;
+        let Some(first) = first else {
+            return Ok(None);
+        };
+        let last = tokio::time::timeout(
+            SHORT_COMMAND_TIMEOUT,
+            oplog.find_one(doc! {}).sort(doc! { "$natural": -1 }),
+        )
+        .await
+        .map_err(|_| anyhow!("reading the newest oplog entry timed out"))?
+        .context("reading the newest oplog entry failed")?;
+        let Some(last) = last else {
+            return Ok(None);
+        };
+        let (Some(first_ts), Some(last_ts)) = (
+            first.get_timestamp("ts").ok(),
+            last.get_timestamp("ts").ok(),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(Duration::from_secs(
+            last_ts.time.saturating_sub(first_ts.time) as u64,
+        )))
     }
 
     /// Initiate a brand-new single-member set with this node as member 0.
@@ -590,6 +659,7 @@ mod tests {
             state_str: String::new(),
             healthy,
             is_self,
+            optime_secs: None,
         }
     }
 
@@ -675,6 +745,32 @@ mod tests {
             split_host_port("[fd12::1]:27017"),
             ("fd12::1".into(), 27017)
         );
+    }
+
+    #[test]
+    fn member_from_doc_reads_optime_seconds_from_the_timestamp_not_the_date() {
+        let m = doc! {
+            "_id": 1i32,
+            "name": "mongo-2:27017",
+            "state": 2i32,
+            "stateStr": "SECONDARY",
+            "health": 1.0,
+            "optime": { "ts": Bson::Timestamp(mongodb::bson::Timestamp { time: 1_700_000_000, increment: 3 }) },
+        };
+        let member = member_from_doc(&m);
+        assert_eq!(member.host, "mongo-2:27017");
+        assert_eq!(member.state_str, "SECONDARY");
+        assert!(member.healthy);
+        assert_eq!(member.optime_secs, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn member_from_doc_tolerates_a_missing_optime() {
+        // A member just added has no optime yet — must not panic or fall
+        // back to a bogus zero that would read as "1970, wildly behind".
+        let m = doc! { "_id": 2i32, "name": "mongo-3:27017", "state": 6i32, "stateStr": "UNKNOWN" };
+        let member = member_from_doc(&m);
+        assert_eq!(member.optime_secs, None);
     }
 
     #[test]

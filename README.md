@@ -60,7 +60,9 @@ decisions:
   majority; 503 in every other case, including when the node cannot confirm
   its own status.
 - `GET /rs/state` — peer exchange (JSON): whether this node holds a set, its
-  primary, whether it holds user data. Consumed by peers' initiate guards.
+  primary, whether it holds user data, and this node's own current oplog
+  window (`oplog_window_seconds`, see Monitoring below). Consumed by peers'
+  initiate guards.
 - `POST /rs/keyfile` — the set's keyfile, to a caller that proves the root
   password (JSON `{username, password}`, verified against this node's mongod).
 - `POST /switchover` — ask THIS node to become the primary (Railway's
@@ -130,6 +132,47 @@ The `mongo-wrapper` binary (one per data node):
   supervisor's whole life, so an overlapping redeploy waits for the previous
   container instead of racing it on WiredTiger's own lock.
 
+## Monitoring / observability
+
+The `replication_monitor` module (`mongo-wrapper/src/replication_monitor.rs`)
+watches for the failure mode field data (Atlas's own oplog-window alert, a
+community-forum operator's 15+ hour stale-secondary incident) shows is the
+most common way a MongoDB replica set silently loses redundancy: a member
+whose replication has fallen behind far enough that it can no longer catch up
+incrementally and needs a full resync. **This is observation and reporting
+only — no self-heal, no auto-resync, no remediation** (see Status below).
+
+On the primary, every `member_duties` poll (the existing 3s supervisor
+cadence — no separate timer) samples:
+
+- **Replication lag vs the primary** — each member's last-applied optime
+  against the primary's, from the same `replSetGetStatus` view the
+  membership-prune round already reads.
+- **The oplog window** — the wall-clock span, oldest to newest entry, that
+  `local.oplog.rs` currently holds on the node being sampled (any node can
+  compute its own; the primary's is what a lagging secondary is actually
+  racing against, since it is the entries the primary has already overwritten
+  that make a secondary un-recoverable).
+- **Member state and how long it has been held** — `stateStr`
+  (RECOVERING/STARTUP2/...) plus a per-host dwell clock, so a member stuck for
+  20 minutes is distinguishable from a normal few-second transition (mongod's
+  own status never reports how long a state has been held; the wrapper tracks
+  it).
+
+A telemetry event (`mongo_ha.component_error`, the same `ComponentError`
+shape every other mongo-specific event already reports through) fires once
+per incident — not once per poll — when:
+
+| Signal | Threshold | Why |
+|---|---|---|
+| Member stuck in RECOVERING/STARTUP2 | `STUCK_STATE_DWELL` = 900s (15m) | Matches mysql-ha's own stuck-member dwell; comfortably above any transient transition, hours short of letting a real stale-secondary incident go unnoticed |
+| Lag eating the oplog window ("about to fall off / fallen off" — the condition that matters most) | lag ≥ 75% of the primary's oplog window (`LAG_VS_OPLOG_WINDOW_WARN_RATIO`) | Fires with lead time before the member is actually unable to catch up (100% of the window), rather than only after |
+| Oplog window itself shrinking | below `OPLOG_WINDOW_FLOOR` = 1h | Comfortably above every planned disruption the wrapper introduces (demote-on-shutdown, a supervised respawn, the initiate/join dwells), so it flags a shrinking oplog long before it becomes a real risk |
+
+This node's own oplog window is also exposed on `GET /rs/state` as
+`oplog_window_seconds` (additive/optional field; older peers mid-rollout
+ignore it).
+
 ## Environment contract
 
 Data node (`mongo-wrapper`):
@@ -169,7 +212,9 @@ Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml
 ## Testing
 
 - `cargo test` — unit tests (initiate decision, config editing, keyfile,
-  HAProxy rendering).
+  HAProxy rendering, replication-monitor threshold derivation against
+  synthetic `replSetGetStatus` shapes: healthy, lagging-but-recoverable,
+  fallen-off-the-oplog, stuck-RECOVERING/STARTUP2).
 - `./test/e2e.sh` — docker-based end-to-end suite: set formation and
   replication, failover on primary pause, cold restart, switchover, demote
   on SIGTERM, wiped-volume rejoin, standalone-volume conversion, scale-up
@@ -182,6 +227,9 @@ Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml
 ## Status
 
 Functional: formation, failover, conversion of a standalone volume, scale
-up/down, partition fencing, switchover, revert. Scoped out of v1: a read port
-over the secondaries; self-heal of a member mongod reports as too stale to
-catch up (it stays RECOVERING for an operator); continuous backup / PITR.
+up/down, partition fencing, switchover, revert, oplog-window / stuck-member
+monitoring (telemetry only — see Monitoring above). Scoped out of v1: a read
+port over the secondaries; self-heal of a member mongod reports as too stale
+to catch up (it stays RECOVERING for an operator — the monitoring above
+reports this so an operator can act, but nothing in the wrapper acts on it
+automatically); continuous backup / PITR.
