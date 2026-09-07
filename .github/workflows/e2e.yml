@@ -1,0 +1,64 @@
+name: E2E
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # A targeted run: only the named scenarios (the harness takes t_* names as
+  # arguments). For iterating on one scenario's failure without paying for
+  # the whole suite; the pull_request run still covers everything.
+  workflow_dispatch:
+    inputs:
+      tests:
+        description: "Space-separated t_* scenario names (empty = whole suite)"
+        type: string
+        default: ""
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    # Replica set formation and initial sync are quick next to MySQL's clone
+    # path, but the deletion scenarios wait out a (shortened) NXDOMAIN dwell
+    # and the whole suite builds the wrapper image once; 60 fits the suite
+    # plus variance without masking a hang — every scenario still fails on
+    # its own internal waits, far below the cap.
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: mongo-wrapper/Dockerfile
+          build-args: MONGO_VERSION=8.0
+          platforms: linux/amd64
+          tags: mongo-ha-e2e:8.0
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run e2e harness
+        # GitHub's default `run:` shell has no pipefail, so without it the
+        # pipe to tee swallows the harness's failure-count exit code and the
+        # job reports success no matter how many scenarios failed.
+        run: set -o pipefail; ./test/e2e.sh ${{ inputs.tests }} 2>&1 | tee e2e.log
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-log
+          path: e2e.log

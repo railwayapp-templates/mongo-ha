@@ -1,0 +1,24 @@
+[package]
+name = "mongo-wrapper"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mongo-wrapper"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+nix.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+mongodb.workspace = true
+# Keyfile derivation (see keyfile.rs): sha256 → base64 turns any shared
+# secret into a string mongod accepts as keyfile content.
+sha2 = "0.10"
+base64 = "0.22"

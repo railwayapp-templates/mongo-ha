@@ -1,0 +1,489 @@
+name: Build and Push Docker Images
+
+on:
+  # Run daily at midnight UTC. Daily (not weekly) keeps the window between an
+  # upstream series release and our first per-series build short: HA
+  # conversion pins the source's own series, so a brand-new upstream series
+  # is convertible only once discover-mongo-series has seen it and this
+  # workflow has published its image.
+  schedule:
+    - cron: '0 0 * * *'
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Bypass the content gate and rebuild+push everything"
+        type: boolean
+        default: false
+  # Build on push to main
+  push:
+    branches:
+      - main
+    paths:
+      - 'mongo-wrapper/**'
+      - 'haproxy/**'
+      - 'common/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/build-and-push.yml'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
+  HAPROXY_VERSION: "3.2"
+  # The single policy knob for which MongoDB majors get per-series builds —
+  # mirrors the template's supportedImageMajorVersions. The `X.Y` series
+  # within each major are discovered from Docker Hub on every run, never
+  # hardcoded here.
+  MONGO_SUPPORTED_MAJORS: "7 8"
+  # No suffix - publish to regular tags
+  BETA_SUFFIX: ''
+
+jobs:
+  # Detect which components changed to avoid unnecessary builds
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      mongo-wrapper: ${{ steps.filter.outputs.mongo-wrapper }}
+      haproxy: ${{ steps.filter.outputs.haproxy }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            mongo-wrapper:
+              - 'mongo-wrapper/**'
+              - 'common/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/build-and-push.yml'
+            haproxy:
+              - 'haproxy/**'
+              - 'common/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/build-and-push.yml'
+
+  # Enumerate every `X.Y` series tag Docker Hub publishes for the supported
+  # MongoDB majors. Discovered per run instead of hardcoded so a new upstream
+  # series starts building the day Docker Hub carries it — the platform's HA
+  # conversion pins the adopted service's own `major.minor` series, so a
+  # series with no published image is a series whose users cannot convert.
+  discover-mongo-series:
+    needs: changes
+    if: ${{ needs.changes.outputs['mongo-wrapper'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    outputs:
+      series: ${{ steps.discover.outputs.series }}
+
+    steps:
+      - name: Discover MongoDB series tags on Docker Hub
+        id: discover
+        run: |
+          # Registry v2 API (registry-1.docker.io, anonymous pull token), not
+          # the Hub website API: hub.docker.com hard-blocks shared GitHub
+          # runner IPs with persistent 403s, while the registry endpoint is
+          # the same path every `docker pull` takes.
+          token=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/mongo:pull" \
+            | jq -r .token)
+          if [ -z "$token" ] || [ "$token" = "null" ]; then
+            echo "could not obtain an anonymous pull token" >&2
+            exit 1
+          fi
+
+          url="https://registry-1.docker.io/v2/library/mongo/tags/list?n=1000"
+          : > /tmp/hub-tags.txt
+          pages=0
+          while [ -n "$url" ]; do
+            if [ "$pages" -ge 50 ]; then
+              echo "more than 50 pages of registry tags; refusing to loop forever" >&2
+              exit 1
+            fi
+            resp=$(curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+              -H "Authorization: Bearer $token" -D /tmp/tag-headers.txt "$url")
+            echo "$resp" | jq -r '.tags[]' >> /tmp/hub-tags.txt
+            next=$(sed -nE 's/^[Ll]ink: *<([^>]+)>; *rel="next".*/\1/p' /tmp/tag-headers.txt | tr -d '\r')
+            if [ -n "$next" ]; then
+              url="https://registry-1.docker.io${next}"
+            else
+              url=""
+            fi
+            pages=$((pages + 1))
+          done
+
+          : > /tmp/series.txt
+          for major in $MONGO_SUPPORTED_MAJORS; do
+            found=$(grep -E "^${major}\.[0-9]+$" /tmp/hub-tags.txt | sort -uV)
+            if [ -z "$found" ]; then
+              # Anti-shrink: an empty result for a supported major means the
+              # discovery is broken, not that the major vanished upstream.
+              echo "no X.Y series discovered for supported major ${major}" >&2
+              exit 1
+            fi
+            echo "$found" >> /tmp/series.txt
+          done
+
+          echo "discovered series:"
+          cat /tmp/series.txt
+
+          echo "series=$(jq -Rnc '[inputs]' < /tmp/series.txt)" >> "$GITHUB_OUTPUT"
+
+      # A published :X.Y tag is a build line users are pinned to. If the
+      # discovered set ever fails to cover one, that series would silently
+      # stop receiving builds — fail the run instead. Best-effort on the
+      # listing side only.
+      - name: Refuse to shrink the published series set (best-effort)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          endpoint="/orgs/${{ github.repository_owner }}/packages/container/mongo-ha%2Fmongo/versions?per_page=100"
+          if published=$(gh api --paginate "$endpoint" --jq '.[].metadata.container.tags[]' 2>/dev/null); then
+            majors_re=$(echo "$MONGO_SUPPORTED_MAJORS" | tr ' ' '|')
+            published_series=$(echo "$published" | grep -E "^(${majors_re})\.[0-9]+$" | sort -uV || true)
+            missing=""
+            for tag in $published_series; do
+              grep -qx "$tag" /tmp/series.txt || missing="$missing $tag"
+            done
+            if [ -n "$missing" ]; then
+              echo "discovered set does not cover already-published series:$missing" >&2
+              exit 1
+            fi
+            echo "coverage ok: all published series are in the discovered set"
+          else
+            echo "warning: could not list published ghcr tags; skipping coverage guard"
+          fi
+
+  # Build Rust binary for mongo-wrapper (AMD64 - alpine, native, fast)
+  # The binary is version-agnostic — one build covers all MongoDB series.
+  build-rust-binaries-mongo-wrapper-amd64:
+    needs: changes
+    if: ${{ needs.changes.outputs['mongo-wrapper'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Build and push rust binaries for mongo-wrapper amd64
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./mongo-wrapper/Dockerfile
+          target: rust-builder-local-output
+          platforms: linux/amd64
+          push: true
+          # SHA-tagged, not :latest — a same-run handoff to
+          # build-mongo-wrapper-amd64, never pulled independently.
+          tags: ${{ env.IMAGE_PREFIX }}/mongo-rust-binaries:${{ steps.sha.outputs.short }}
+          cache-from: type=gha,scope=mongo-rust-binaries
+          cache-to: type=gha,mode=max,scope=mongo-rust-binaries
+
+  # Build Rust binary for haproxy (AMD64 - alpine, native, fast)
+  build-rust-binaries-haproxy-amd64:
+    needs: changes
+    if: ${{ needs.changes.outputs.haproxy == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Build and push rust binaries for haproxy amd64
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./haproxy/Dockerfile
+          target: rust-builder-local-output
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_PREFIX }}/haproxy-rust-binaries:${{ steps.sha.outputs.short }}
+          cache-from: type=gha,scope=haproxy-rust-binaries
+          cache-to: type=gha,mode=max,scope=haproxy-rust-binaries
+
+  # Build mongo-wrapper for AMD64 — one continuously rebuilt image per
+  # MongoDB `X.Y` series, discovered from Docker Hub each run. The platform's
+  # HA conversion pins a converted service to its own `major.minor` series
+  # tag, so every series a user might be standing on must be a real build
+  # line that keeps receiving upstream patch, base-image and wrapper updates.
+  build-mongo-wrapper-amd64:
+    needs: [changes, build-rust-binaries-mongo-wrapper-amd64, discover-mongo-series]
+    if: ${{ needs.changes.outputs['mongo-wrapper'] == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      # Each series is an independent build line — one broken series must
+      # not cancel the others' builds.
+      fail-fast: false
+      matrix:
+        mongo_version: ${{ fromJson(needs.discover-mongo-series.outputs.series) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      # Skip the build entirely — same digest, no fleet redeploys — unless
+      # something REAL moved: the repo code that reaches the image, the
+      # upstream base image, or the base's pending-security-fix set. The key
+      # is planted on the published image as a label; digest-tracking
+      # consumers only see a new digest when there is something worth
+      # redeploying for. Fails OPEN to building — a gate error must never
+      # silently freeze a tag.
+      - name: Content gate
+        id: gate
+        run: |
+          set -o pipefail
+          IMG="${{ env.IMAGE_PREFIX }}/mongo"
+          TAG="${{ matrix.mongo_version }}${{ env.BETA_SUFFIX }}"
+          BASE="mongo:${{ matrix.mongo_version }}"
+
+          GATE_OK=true
+          CODE_KEY=$(git rev-parse HEAD:mongo-wrapper HEAD:common HEAD:Cargo.toml HEAD:Cargo.lock | sha256sum | cut -c1-16) || GATE_OK=false
+          BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
+          docker pull -q "$BASE" >/dev/null || GATE_OK=false
+          # Ubuntu base: apt. `apt-get -s upgrade` prints the pending set
+          # without applying it; hold the mongodb-org packages out of it the
+          # same way the Dockerfile does.
+          PKG_RAW=$(docker run --rm --user root "$BASE" bash -c "apt-get update -qq >/dev/null 2>&1; apt-mark hold 'mongodb-org*' >/dev/null 2>&1; apt-get -s upgrade 2>/dev/null | grep '^Inst' | sort" || true)
+          [ -n "$PKG_RAW" ] || PKG_RAW="no-pending-upgrades"
+          PKG_KEY=$(printf '%s' "$PKG_RAW" | sha256sum | cut -c1-16)
+
+          if [ "$GATE_OK" != "true" ] || [ -z "$CODE_KEY" ] || [ -z "$BASE_DIGEST" ] || [ -z "$PKG_KEY" ]; then
+            echo "::warning::content gate failed for ${TAG}; building unconditionally"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "key=gate-error-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEY=$(printf '%s\n' "$CODE_KEY" "$BASE_DIGEST" "$PKG_KEY" | sha256sum | cut -c1-32)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+          PUBLISHED_KEY=$(docker buildx imagetools inspect "$IMG:$TAG" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(.config // .["linux/amd64"].config) | .Labels["railway.content-key"] // empty' 2>/dev/null || true)
+
+          if [ "${{ github.event.inputs.force || 'false' }}" = "true" ]; then
+            echo "force requested — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$KEY" = "$PUBLISHED_KEY" ]; then
+            echo "unchanged (key $KEY) — skipping build; digest stays put"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed (key $KEY, published ${PUBLISHED_KEY:-<none>}) — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Push only the immutable sha tag here; the resolvable :X.Y series tag
+      # is minted below AFTER the bundled-version guard, so a base-image
+      # mixup can never reach a tag the platform pins. No :latest.
+      - name: Build and push mongo-wrapper for amd64
+        if: steps.gate.outputs.changed == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./mongo-wrapper/Dockerfile
+          build-args: |
+            MONGO_VERSION=${{ matrix.mongo_version }}
+            PKG_REFRESH=${{ steps.gate.outputs.key }}
+          labels: |
+            railway.content-key=${{ steps.gate.outputs.key }}
+          build-contexts: |
+            rust-binaries=docker-image://${{ env.IMAGE_PREFIX }}/mongo-rust-binaries:${{ steps.sha.outputs.short }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/mongo:${{ matrix.mongo_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/mongo:${{ matrix.mongo_version }}${{ env.BETA_SUFFIX }}
+          cache-to: type=inline
+
+      # Unchanged image: keep the per-commit pin tag current WITHOUT minting
+      # a new digest — imagetools create only adds a tag reference.
+      - name: Refresh pin tags on unchanged image
+        if: steps.gate.outputs.changed == 'false'
+        run: |
+          IMG="${{ env.IMAGE_PREFIX }}/mongo"
+          docker buildx imagetools create \
+            -t "$IMG:${{ matrix.mongo_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}" \
+            "$IMG:${{ matrix.mongo_version }}${{ env.BETA_SUFFIX }}"
+
+      # The tag IS the compatibility contract (the conversion pin trusts that
+      # :8.0 bundles a MongoDB 8.0.x), so refuse to publish a build whose base
+      # image bundles anything else rather than poison the tag.
+      - name: Verify the bundled series matches the matrix entry, then publish
+        if: steps.gate.outputs.changed == 'true'
+        run: |
+          img="${{ env.IMAGE_PREFIX }}/mongo:${{ matrix.mongo_version }}-${{ steps.sha.outputs.short }}${{ env.BETA_SUFFIX }}"
+          version=$(docker run --rm --entrypoint mongod "$img" --version | head -1)
+          echo "bundled: $version"
+          series=$(echo "$version" | sed -nE 's/.*db version v([0-9]+\.[0-9]+)\..*/\1/p')
+          if [ -z "$series" ]; then
+            echo "could not parse a major.minor out of mongod --version" >&2
+            exit 1
+          fi
+          if [ "$series" != "${{ matrix.mongo_version }}" ]; then
+            echo "bundled series $series does not match matrix entry ${{ matrix.mongo_version }}" >&2
+            exit 1
+          fi
+
+          docker buildx imagetools create \
+            -t "${{ env.IMAGE_PREFIX }}/mongo:${{ matrix.mongo_version }}${{ env.BETA_SUFFIX }}" \
+            "$img"
+
+  # Build haproxy image for AMD64
+  build-haproxy-amd64:
+    needs: [changes, build-rust-binaries-haproxy-amd64]
+    if: ${{ needs.changes.outputs.haproxy == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get short SHA and version parts
+        id: meta
+        run: |
+          echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+          echo "major=$(echo ${{ env.HAPROXY_VERSION }} | cut -d. -f1)" >> $GITHUB_OUTPUT
+
+      # Same content gate as mongo-wrapper (see that job for rationale);
+      # package dimension via apt (debian base — mongosh needs glibc). The
+      # fleet's edge nodes run autoUpdates tagMode "sha" — a spuriously
+      # re-minted digest here rolls every HAProxy in every cluster for
+      # nothing.
+      - name: Content gate
+        id: gate
+        run: |
+          set -o pipefail
+          IMG="${{ env.IMAGE_PREFIX }}/haproxy"
+          TAG="${{ env.HAPROXY_VERSION }}${{ env.BETA_SUFFIX }}"
+          BASE="haproxy:${{ env.HAPROXY_VERSION }}"
+
+          GATE_OK=true
+          CODE_KEY=$(git rev-parse HEAD:haproxy HEAD:common HEAD:Cargo.toml HEAD:Cargo.lock | sha256sum | cut -c1-16) || GATE_OK=false
+          BASE_DIGEST=$(docker buildx imagetools inspect "$BASE" --format '{{json .Manifest.Digest}}' | tr -d '"') || GATE_OK=false
+          docker pull -q "$BASE" >/dev/null || GATE_OK=false
+          PKG_RAW=$(docker run --user root --rm "$BASE" bash -c "apt-get update -qq >/dev/null 2>&1; apt-get -s upgrade 2>/dev/null | grep '^Inst' | sort" || true)
+          [ -n "$PKG_RAW" ] || PKG_RAW="no-pending-upgrades"
+          PKG_KEY=$(printf '%s' "$PKG_RAW" | sha256sum | cut -c1-16)
+
+          if [ "$GATE_OK" != "true" ] || [ -z "$CODE_KEY" ] || [ -z "$BASE_DIGEST" ] || [ -z "$PKG_KEY" ]; then
+            echo "::warning::content gate failed for haproxy; building unconditionally"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "key=gate-error-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          KEY=$(printf '%s\n' "$CODE_KEY" "$BASE_DIGEST" "$PKG_KEY" | sha256sum | cut -c1-32)
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+          PUBLISHED_KEY=$(docker buildx imagetools inspect "$IMG:$TAG" --format '{{json .Image}}' 2>/dev/null \
+            | jq -r '(.config // .["linux/amd64"].config) | .Labels["railway.content-key"] // empty' 2>/dev/null || true)
+
+          if [ "${{ github.event.inputs.force || 'false' }}" = "true" ]; then
+            echo "force requested — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          elif [ "$KEY" = "$PUBLISHED_KEY" ]; then
+            echo "unchanged (key $KEY) — skipping build; digest stays put"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed (key $KEY, published ${PUBLISHED_KEY:-<none>}) — building"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push haproxy for amd64
+        if: steps.gate.outputs.changed == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./haproxy/Dockerfile
+          build-args: |
+            HAPROXY_VERSION=${{ env.HAPROXY_VERSION }}
+            PKG_REFRESH=${{ steps.gate.outputs.key }}
+          labels: |
+            railway.content-key=${{ steps.gate.outputs.key }}
+          build-contexts: |
+            rust-binaries=docker-image://${{ env.IMAGE_PREFIX }}/haproxy-rust-binaries:${{ steps.meta.outputs.short }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_PREFIX }}/haproxy:${{ env.HAPROXY_VERSION }}${{ env.BETA_SUFFIX }}
+            ${{ env.IMAGE_PREFIX }}/haproxy:${{ steps.meta.outputs.major }}${{ env.BETA_SUFFIX }}
+            ${{ env.IMAGE_PREFIX }}/haproxy:${{ env.HAPROXY_VERSION }}-${{ steps.meta.outputs.short }}${{ env.BETA_SUFFIX }}
+          cache-from: type=registry,ref=${{ env.IMAGE_PREFIX }}/haproxy:${{ env.HAPROXY_VERSION }}
+          cache-to: type=inline
+
+      - name: Refresh pin tags on unchanged image
+        if: steps.gate.outputs.changed == 'false'
+        run: |
+          IMG="${{ env.IMAGE_PREFIX }}/haproxy"
+          SRC="$IMG:${{ env.HAPROXY_VERSION }}${{ env.BETA_SUFFIX }}"
+          docker buildx imagetools create \
+            -t "$IMG:${{ steps.meta.outputs.major }}${{ env.BETA_SUFFIX }}" \
+            -t "$IMG:${{ env.HAPROXY_VERSION }}-${{ steps.meta.outputs.short }}${{ env.BETA_SUFFIX }}" \
+            "$SRC"
