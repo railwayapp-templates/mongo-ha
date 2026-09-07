@@ -78,6 +78,12 @@ pub enum RsStatus {
         my_state: i32,
         my_state_str: String,
         members: Vec<RsMember>,
+        /// `votingMembersCount`: members whose vote counts right now. A member
+        /// added seconds ago is `newlyAdded` (non-voting) until its initial
+        /// sync completes and the primary's automatic reconfig commits — a
+        /// set can look fully healthy and still be unable to elect. Absent on
+        /// servers that do not report it.
+        voting_members: Option<usize>,
     },
 }
 
@@ -91,6 +97,10 @@ pub struct Mongo {
     host: String,
     port: u16,
     username: String,
+    /// The password the pooled client currently authenticates with; kept so
+    /// a throwaway client (fresh authorization, see drop_stale_replset_config)
+    /// can be built with the same identity.
+    password: Arc<RwLock<String>>,
     /// Swappable: built with the boot-time password (the pin's, when one
     /// exists), and replaced by the credential resolver once it has proven a
     /// different password against the live server (see auth_pin.rs). Every
@@ -199,6 +209,7 @@ impl Mongo {
             host: "127.0.0.1".to_string(),
             port,
             username: username.to_string(),
+            password: Arc::new(RwLock::new(password.to_string())),
             client: Arc::new(RwLock::new(client_for(
                 "127.0.0.1",
                 port,
@@ -215,6 +226,7 @@ impl Mongo {
     pub async fn swap_password(&self, password: &str) {
         let fresh = client_for(&self.host, self.port, &self.username, password, true);
         let old = std::mem::replace(&mut *self.client.write().await, fresh);
+        *self.password.write().await = password.to_string();
         old.shutdown().await;
     }
 
@@ -234,6 +246,7 @@ impl Mongo {
             host,
             port,
             username: username.to_string(),
+            password: Arc::new(RwLock::new(password.to_string())),
         }
     }
 
@@ -301,6 +314,8 @@ impl Mongo {
                         .map(|m| m.state_str.clone())
                         .unwrap_or_default(),
                     members,
+                    voting_members: bson_int(d.get("votingMembersCount"))
+                        .map(|n| n.max(0) as usize),
                 })
             }
             Err(e) if command_error_code(&e) == Some(codes::NOT_YET_INITIALIZED) => {
@@ -372,11 +387,20 @@ impl Mongo {
     /// moment mongod runs with `--replSet` again. The documented way back to
     /// a clean standalone is to drop the `local` database; this does exactly
     /// that, and only when such a config exists. Returns whether it did.
+    ///
+    /// The `root` role carries no `dropDatabase` on `local` (its
+    /// dbAdminAnyDatabase excludes `local` and `config`; the first CI run
+    /// hit `Unauthorized` here), so the drop runs under a temporary
+    /// maintenance role: created, granted to this user, used from a fresh
+    /// connection, then revoked and dropped again — no artifact stays behind.
     pub async fn drop_stale_replset_config(&self) -> Result<bool> {
-        let local = self.client.read().await.clone().database("local");
         let count = tokio::time::timeout(
             SHORT_COMMAND_TIMEOUT,
-            local
+            self.client
+                .read()
+                .await
+                .clone()
+                .database("local")
                 .collection::<Document>("system.replset")
                 .count_documents(doc! {}),
         )
@@ -386,11 +410,60 @@ impl Mongo {
         if count == 0 {
             return Ok(false);
         }
-        tokio::time::timeout(RECONFIG_TIMEOUT, local.drop())
+
+        const ROLE: &str = "railwayLocalMaintenance";
+        let role_ref = doc! { "role": ROLE, "db": "admin" };
+        match self
+            .admin(
+                doc! {
+                    "createRole": ROLE,
+                    "privileges": [ {
+                        "resource": { "db": "local", "collection": "" },
+                        "actions": [ "dropDatabase", "dropCollection" ],
+                    } ],
+                    "roles": [],
+                },
+                SHORT_COMMAND_TIMEOUT,
+            )
             .await
-            .map_err(|_| anyhow!("dropping the local database timed out"))?
-            .context("dropping the local database failed")?;
-        Ok(true)
+        {
+            Ok(_) => {}
+            // 51002 DuplicateKey: the role is left over from an interrupted
+            // earlier attempt; granting it below is all that matters.
+            Err(e) if command_error_code(&e) == Some(51002) => {}
+            Err(e) => return Err(e).context("creating the local-maintenance role"),
+        }
+        self.admin(
+            doc! { "grantRolesToUser": self.username.clone(), "roles": [ role_ref.clone() ] },
+            SHORT_COMMAND_TIMEOUT,
+        )
+        .await
+        .context("granting the local-maintenance role")?;
+
+        // A fresh connection picks the new privilege up unconditionally (the
+        // server invalidates its user cache on a grant, but a new session is
+        // the version of that guarantee this code does not have to trust).
+        let password = self.password.read().await.clone();
+        let fresh = client_for(&self.host, self.port, &self.username, &password, true);
+        let dropped = tokio::time::timeout(RECONFIG_TIMEOUT, fresh.database("local").drop())
+            .await
+            .map_err(|_| anyhow!("dropping the local database timed out"))
+            .and_then(|r| r.context("dropping the local database failed"));
+        fresh.shutdown().await;
+
+        // Best effort: the role's job is done either way, and a failure to
+        // clean up must not hide the drop's own verdict.
+        let _ = self
+            .admin(
+                doc! { "revokeRolesFromUser": self.username.clone(), "roles": [ role_ref ] },
+                SHORT_COMMAND_TIMEOUT,
+            )
+            .await;
+        let _ = self
+            .admin(doc! { "dropRole": ROLE }, SHORT_COMMAND_TIMEOUT)
+            .await;
+
+        dropped.map(|_| true)
     }
 
     /// Raw admin command, for the few call sites that need something not

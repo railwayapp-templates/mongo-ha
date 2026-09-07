@@ -173,7 +173,17 @@ healthy_members() {
   mongo "$1" 'try { const s = rs.status(); print(s.members.filter(m => m.state === 1 || m.state === 2).length) } catch (e) { print(0) }' | tr -d '[:space:]'
 }
 
-has_n_healthy() { [ "$(healthy_members "$1")" = "$2" ]; }
+# voting_members <node> — `votingMembersCount`: a member that just joined is
+# `newlyAdded` (non-voting) until its initial sync completes and the primary's
+# automatic reconfig commits. In that window the set reads fully healthy yet a
+# primary loss finds no electable majority ("Not standing for election because
+# I cannot see a majority") — exactly what the first CI run hit by pausing the
+# primary 1.5s after formation. Readiness therefore means healthy AND voting.
+voting_members() {
+  mongo "$1" 'try { print(rs.status().votingMembersCount) } catch (e) { print(0) }' | tr -d '[:space:]'
+}
+
+has_n_healthy() { [ "$(healthy_members "$1")" = "$2" ] && [ "$(voting_members "$1")" = "$2" ]; }
 set_is_fully_online() { has_n_healthy "$1" 3; }
 
 my_state() { mongo "$1" 'try { print(rs.status().myState) } catch (e) { print(-1) }' | tr -d '[:space:]'; }
@@ -312,6 +322,13 @@ t_cold_restart_preserves_set() {
   log "t_cold_restart_preserves_set (reuses the running trio)"
   set_is_fully_online mongo-2 || { bad "no set to cold-restart"; return; }
 
+  # Own canary, written on the current primary: the scenario must not depend
+  # on an earlier one having written anything.
+  local primary
+  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" || { bad "no primary before the cold restart"; return; }
+  mongo "$primary" 'db.getSiblingDB("t").kv.replaceOne({_id: 3}, {_id: 3, v: "pre-cold-restart"}, {upsert: true, writeConcern: {w: "majority"}})' | grep -q acknowledged \
+    || { bad "pre-cold-restart write was not acknowledged"; return; }
+
   docker stop -t 60 mongo-1 mongo-2 mongo-3 >/dev/null
   log "all nodes stopped; starting them back up"
   docker start mongo-1 mongo-2 mongo-3 >/dev/null
@@ -321,8 +338,8 @@ t_cold_restart_preserves_set() {
   ok "set reformed after full outage"
 
   local v
-  v="$(mongo mongo-1 'db.getSiblingDB("t").kv.findOne({_id: 2}).v')"
-  if [ "$v" = "post-failover" ]; then
+  v="$(mongo mongo-1 'db.getSiblingDB("t").kv.findOne({_id: 3}).v')"
+  if [ "$v" = "pre-cold-restart" ]; then
     ok "data survived the cold restart"
   else
     bad "data lost after cold restart (got: '$v')"
@@ -534,8 +551,11 @@ t_wiped_member_volume_rejoins_fresh() {
   # A member whose volume is lost comes back under the same name with an
   # empty data dir: it is still in the set's config, so the primary delivers
   # the config over heartbeats and initial sync rebuilds it — no reconfig.
-  local victim
-  victim="$(printf 'mongo-1\nmongo-2\nmongo-3\n' | grep -v "^$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)$" | head -1)"
+  local primary victim
+  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" || { bad "no primary before wiping a member"; return; }
+  mongo "$primary" 'db.getSiblingDB("t").kv.replaceOne({_id: 4}, {_id: 4, v: "pre-wipe"}, {upsert: true, writeConcern: {w: "majority"}})' | grep -q acknowledged \
+    || { bad "pre-wipe write was not acknowledged"; return; }
+  victim="$(printf 'mongo-1\nmongo-2\nmongo-3\n' | grep -v "^$primary$" | head -1)"
   local n="${victim#mongo-}"
   docker rm -f "$victim" >/dev/null
   docker volume rm "mongo-ha-e2e-vol-$n" >/dev/null
@@ -549,7 +569,7 @@ t_wiped_member_volume_rejoins_fresh() {
     bad "wiped member did not take the heartbeat-config path"
   fi
   wait_until 60 "data on the rebuilt member" \
-    bash -c "[ \"\$(docker exec $victim mongosh --quiet 'mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin?directConnection=true' --eval 'db.getSiblingDB(\"t\").kv.findOne({_id: 2}).v' 2>/dev/null)\" = post-failover ]" \
+    bash -c "[ \"\$(docker exec $victim mongosh --quiet 'mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin?directConnection=true' --eval 'db.getSiblingDB(\"t\").kv.findOne({_id: 4}).v' 2>/dev/null)\" = pre-wipe ]" \
     && ok "rebuilt member holds the set's data" || bad "rebuilt member is missing data"
 }
 
@@ -619,7 +639,17 @@ t_revert_to_standalone_and_reconvert() {
   teardown_trio
   start_trio
   wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }
-  mongo mongo-1 'db.getSiblingDB("t").kv.replaceOne({_id: 9}, {_id: 9, v: "before-revert"}, {upsert: true})' >/dev/null
+  local primary
+  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" || { bad "no primary before the revert"; return; }
+  mongo "$primary" 'db.getSiblingDB("t").kv.replaceOne({_id: 9}, {_id: 9, v: "before-revert"}, {upsert: true, writeConcern: {w: "majority"}})' | grep -q acknowledged \
+    || { bad "pre-revert write was not acknowledged"; return; }
+  # The revert keeps the ROOT; make sure it is the primary holding the write
+  # (it usually is — a fresh trio's mongo-1 initiates — but never assume).
+  if [ "$primary" != "mongo-1" ]; then
+    switchover_code mongo-2 mongo-1 >/dev/null
+    wait_until 60 "root is primary before the revert" bash -c '[ "$(docker exec mongo-2 wget -q -O /dev/null http://mongo-1:8080/role 2>/dev/null && echo 200 || echo 503)" = 200 ]' \
+      || { bad "root could not reclaim primary before the revert"; return; }
+  fi
 
   # Revert: the platform deletes the replicas and strips RS_SEEDS/RS_ENABLED
   # from the root, which reboots standalone on the same image and volume.
@@ -639,6 +669,10 @@ t_revert_to_standalone_and_reconvert() {
   ok "reverted root serves standalone"
   wait_until 60 "stale replica set config dropped" bash -c 'docker logs mongo-1 2>&1 | grep -F "dropped the replica set config" >/dev/null' \
     && ok "stale replica set config dropped on revert" || bad "stale replica set config not dropped"
+  [ "$(mongo mongo-1 'db.getSiblingDB("local").system.replset.countDocuments({})' | tr -d '[:space:]')" = "0" ] \
+    && ok "local.system.replset is empty on the reverted root" || bad "local.system.replset still holds a config on the reverted root"
+  [ "$(mongo mongo-1 'db.getSiblingDB("admin").system.roles.countDocuments({role: "railwayLocalMaintenance"})' | tr -d '[:space:]')" = "0" ] \
+    && ok "the maintenance role left no artifact" || bad "the maintenance role was left behind in admin.system.roles"
   local v
   v="$(mongo mongo-1 'db.getSiblingDB("t").kv.findOne({_id: 9}).v')"
   [ "$v" = "before-revert" ] && ok "data intact after revert" || bad "data lost on revert (got '$v')"
@@ -654,7 +688,7 @@ t_revert_to_standalone_and_reconvert() {
   wait_until 300 "3 healthy after re-conversion" set_is_fully_online mongo-1 \
     || { bad "re-conversion did not form a set"; return; }
   ok "re-converted from the reverted volume"
-  [ "$(role_code mongo-2 mongo-1)" = "200" ] && ok "adopted root is the primary again" || bad "a fresh node initiated over the reverted root"
+  [ "$(role_code mongo-2 mongo-1)" = "200" ] && ok "adopted root is the primary again (its data won the initiate tie-break)" || bad "the reverted root is not the primary after re-conversion"
   v="$(mongo mongo-3 'db.getSiblingDB("t").kv.findOne({_id: 10}).v')"
   [ "$v" = "standalone-write" ] && ok "standalone-era write reached a fresh replica" || bad "standalone-era write missing on replica (got '$v')"
 }

@@ -31,6 +31,13 @@ pub struct RsState {
     pub members: Vec<String>,
     pub members_total: usize,
     pub members_healthy: usize,
+    /// Members whose vote counts right now (`votingMembersCount`). A member
+    /// that just joined is non-voting (`newlyAdded`) until its initial sync
+    /// completes and the primary's automatic reconfig commits, so a set can
+    /// read fully healthy and still be one node away from being unable to
+    /// elect. Absent on servers that do not report the field.
+    #[serde(default)]
+    pub voting_members: Option<usize>,
     /// True when this node's data dir already held an initialized mongod
     /// dataset when the container started — an adopted standalone volume (or
     /// a returning member), never a fresh node the entrypoint just

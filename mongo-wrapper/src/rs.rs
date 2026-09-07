@@ -111,6 +111,7 @@ pub async fn local_rs_state(mongo: &Mongo, config: &Config, has_data: bool) -> R
             members: vec![],
             members_total: 0,
             members_healthy: 0,
+            voting_members: None,
             has_data,
             config_version: None,
         },
@@ -119,6 +120,7 @@ pub async fn local_rs_state(mongo: &Mongo, config: &Config, has_data: bool) -> R
             my_state,
             my_state_str,
             members,
+            voting_members,
         } => {
             let primary_host = members
                 .iter()
@@ -141,6 +143,7 @@ pub async fn local_rs_state(mongo: &Mongo, config: &Config, has_data: bool) -> R
                 members_total: members.len(),
                 members_healthy: members.iter().filter(|m| m.healthy || m.is_self).count(),
                 members: members.into_iter().map(|m| m.host).collect(),
+                voting_members,
                 has_data,
                 config_version,
             }
@@ -685,10 +688,16 @@ pub async fn standalone_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc
         ),
         Ok(false) => {}
         Err(e) => {
-            error!(error = %e, "could not check/drop a stale replica set config");
+            // `{:#}` keeps the cause chain: the server's own refusal is the
+            // line that explains anything (the first CI run logged only the
+            // outer context and hid an Unauthorized underneath).
+            error!(
+                error = format!("{e:#}"),
+                "could not check/drop a stale replica set config"
+            );
             telemetry.send(TelemetryEvent::ComponentError {
                 component: "mongo-wrapper".to_string(),
-                error: e.to_string(),
+                error: format!("{e:#}"),
                 context: "drop_stale_replset_config".to_string(),
             });
         }
@@ -847,6 +856,7 @@ mod tests {
             members: vec![],
             members_total: 0,
             members_healthy: 0,
+            voting_members: None,
             has_data,
             config_version: None,
         };
