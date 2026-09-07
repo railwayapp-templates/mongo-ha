@@ -39,8 +39,20 @@ dump_logs_once() {
   DUMPED_THIS_SCENARIO=1
   local c
   for c in $(docker ps -a --filter "label=$LABEL" --format '{{.Names}}' 2>/dev/null); do
-    printf '\033[1;33m[logs]\033[0m ---- %s (last 80 lines) ----\n' "$c"
-    docker logs --tail 80 "$c" 2>&1 | cut -c1-400
+    # The wrapper's own lines (JSON with "level") plus mongod's replication,
+    # election and control components — the auth/connection chatter the
+    # health probes generate every few seconds would otherwise fill the tail.
+    printf '\033[1;33m[logs]\033[0m ---- %s (wrapper + REPL/ELECTION/CONTROL, last 60) ----\n' "$c"
+    docker logs "$c" 2>&1 | grep -E '"level":|"c":"(REPL|ELECTION|CONTROL|STORAGE|-)"' | grep -vE '"id":(20436|6788604|5286306|22943|22944|51800|20883)' | tail -60 | cut -c1-360
+    if docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null | grep -q true; then
+      printf '\033[1;33m[state]\033[0m %s rs.status: ' "$c"
+      docker exec "$c" mongosh --quiet "mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin?directConnection=true" \
+        --eval 'try { const s = rs.status(); print(JSON.stringify({set: s.set, myState: s.myState, voting: s.votingMembersCount, members: s.members.map(m => ({n: m.name, st: m.stateStr, h: m.health, votes: m.votes}))})) } catch (e) { print("ERR " + e.message) }' 2>&1 | tail -1 | cut -c1-500
+      printf '\033[1;33m[state]\033[0m %s /rs/state: ' "$c"
+      docker exec "$c" wget -q -O - "http://127.0.0.1:8080/rs/state" 2>&1 | tail -1 | cut -c1-400; echo
+      printf '\033[1;33m[state]\033[0m %s /role: ' "$c"
+      docker exec "$c" wget -q -S -O - "http://127.0.0.1:8080/role" 2>&1 | grep -E "HTTP/|^[a-z]" | head -2 | tr '\n' ' '; echo
+    fi
   done
 }
 
@@ -152,6 +164,15 @@ mongo() {
   docker exec "$node" mongosh --quiet \
     "mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin?directConnection=true&authSource=admin" \
     --eval "$1" 2>/dev/null
+}
+
+# mongo_diag <node> <js> — like mongo(), but stderr comes along (for a read
+# whose empty answer needs the driver's own reason to be diagnosable).
+mongo_diag() {
+  local node="$1"; shift
+  docker exec "$node" mongosh --quiet \
+    "mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin?directConnection=true&authSource=admin" \
+    --eval "$1" 2>&1
 }
 
 # role_code <from-node> <target-node> — HTTP status class of /role (200|503).
@@ -675,7 +696,12 @@ t_revert_to_standalone_and_reconvert() {
     && ok "the maintenance role left no artifact" || bad "the maintenance role was left behind in admin.system.roles"
   local v
   v="$(mongo mongo-1 'db.getSiblingDB("t").kv.findOne({_id: 9}).v')"
-  [ "$v" = "before-revert" ] && ok "data intact after revert" || bad "data lost on revert (got '$v')"
+  if [ "$v" = "before-revert" ]; then
+    ok "data intact after revert"
+  else
+    log "revert read diagnostics: $(mongo_diag mongo-1 'JSON.stringify({doc: db.getSiblingDB("t").kv.findOne({_id: 9}), count: db.getSiblingDB("t").kv.countDocuments({}), dbs: db.adminCommand({listDatabases: 1, nameOnly: true}).databases.map(d => d.name)})' | tail -3)"
+    bad "data lost on revert (got '$v')"
+  fi
   if mongo mongo-1 'db.getSiblingDB("t").kv.insertOne({_id: 10, v: "standalone-write"})' | grep -q acknowledged; then
     ok "reverted root accepts writes"
   else

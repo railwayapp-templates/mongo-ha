@@ -206,7 +206,7 @@ async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         };
         for host in &others {
             if let Err(e) = member(host).freeze(FREEZE_SECS).await {
-                warn!(%host, error = %e, "could not freeze a secondary; it may win the election instead");
+                warn!(%host, error = %format!("{e:#}"), "could not freeze a secondary; it may win the election instead");
             }
         }
 
@@ -244,13 +244,13 @@ async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                     .unwrap_or(false)
             }
             Err(e) => {
-                warn!(error = %e, "step-down refused");
+                warn!(error = %format!("{e:#}"), "step-down refused");
                 false
             }
         };
         for host in &others {
             if let Err(e) = member(host).freeze(0).await {
-                warn!(%host, error = %e, "could not unfreeze a secondary (the freeze expires on its own)");
+                warn!(%host, error = %format!("{e:#}"), "could not unfreeze a secondary (the freeze expires on its own)");
             }
         }
         if !won {
@@ -267,7 +267,7 @@ async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             (StatusCode::OK, "switchover complete".to_string())
         }
         Ok(Err(e)) => {
-            warn!(error = %e, "switchover refused");
+            warn!(error = %format!("{e:#}"), "switchover refused");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("switchover refused: {e:#}"),
@@ -339,7 +339,7 @@ pub async fn run_health_server_supervised(
                 "run loop returned cleanly".to_string()
             }
             Ok(Err(e)) => {
-                error!(error = %e, "health server failed; restarting");
+                error!(error = %format!("{e:#}"), "health server failed; restarting");
                 format!("bind/serve failed: {e:#}")
             }
             Err(e) if e.is_panic() => {
@@ -347,7 +347,7 @@ pub async fn run_health_server_supervised(
                 "task panicked".to_string()
             }
             Err(e) => {
-                error!(error = %e, "health server task was cancelled; restarting");
+                error!(error = %format!("{e:#}"), "health server task was cancelled; restarting");
                 "task cancelled".to_string()
             }
         };

@@ -50,7 +50,7 @@ pub async fn demote_if_primary(ctx: &DemoteCtx) {
         Ok(Ok(true)) => info!("demoted before shutdown: primary stepped down"),
         Ok(Ok(false)) => {}
         Ok(Err(e)) => {
-            warn!(error = %e, "demote-on-shutdown failed; proceeding with shutdown");
+            warn!(error = %format!("{e:#}"), "demote-on-shutdown failed; proceeding with shutdown");
         }
         Err(_) => {
             warn!(

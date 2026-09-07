@@ -57,7 +57,7 @@ pub fn write_keyfile_content(path: &str, content: &str) -> Result<()> {
     match nix::unistd::User::from_name(MONGOD_USER) {
         Ok(Some(user)) => {
             if let Err(e) = nix::unistd::chown(path, Some(user.uid), Some(user.gid)) {
-                warn!(error = %e, user = MONGOD_USER, "could not chown the keyfile; mongod may refuse it");
+                warn!(error = %format!("{e:#}"), user = MONGOD_USER, "could not chown the keyfile; mongod may refuse it");
             }
         }
         Ok(None) => warn!(
@@ -65,7 +65,7 @@ pub fn write_keyfile_content(path: &str, content: &str) -> Result<()> {
             "mongod user not found; keyfile left owned by the wrapper"
         ),
         Err(e) => {
-            warn!(error = %e, "could not look up the mongod user; keyfile left owned by the wrapper")
+            warn!(error = %format!("{e:#}"), "could not look up the mongod user; keyfile left owned by the wrapper")
         }
     }
 

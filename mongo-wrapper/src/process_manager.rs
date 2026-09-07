@@ -60,7 +60,7 @@ pub async fn supervise(
                         s.code().unwrap_or(1)
                     }
                     Err(e) => {
-                        error!(error = %e, "mongod wait error");
+                        error!(error = %format!("{e:#}"), "mongod wait error");
                         1
                     }
                 };

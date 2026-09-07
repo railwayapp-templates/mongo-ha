@@ -79,7 +79,7 @@ pub async fn wait_for_final_mongod(mongo: &Mongo, config: &Config) -> Hello {
             Ok(h) => return h,
             Err(e) => {
                 if attempts.is_multiple_of(30) {
-                    info!(attempts, error = %e, "still waiting for mongod");
+                    info!(attempts, error = %format!("{e:#}"), "still waiting for mongod");
                 }
             }
         }
@@ -297,7 +297,7 @@ async fn query_peers(
     for h in handles {
         match h.await {
             Ok(a) => answers.push(a),
-            Err(e) => warn!(error = %e, "peer query task failed"),
+            Err(e) => warn!(error = %format!("{e:#}"), "peer query task failed"),
         }
     }
     answers
@@ -427,7 +427,7 @@ pub async fn orchestrate(
         let status = match mongo.rs_status().await {
             Ok(s) => s,
             Err(e) => {
-                warn!(error = %e, "replSetGetStatus failed; retrying");
+                warn!(error = %format!("{e:#}"), "replSetGetStatus failed; retrying");
                 tokio::time::sleep(POLL_INTERVAL).await;
                 continue;
             }
@@ -484,10 +484,10 @@ pub async fn orchestrate(
                                         | Some(codes::NOT_WRITABLE_PRIMARY)
                                 ) {
                                     if wait_log_once(&mut last_log, "reconfig-retry") {
-                                        info!(error = %e, "set busy or primary moved; retrying the join");
+                                        info!(error = %format!("{e:#}"), "set busy or primary moved; retrying the join");
                                     }
                                 } else if wait_log_once(&mut last_log, "join-error") {
-                                    warn!(error = %e, "join attempt failed; retrying");
+                                    warn!(error = %format!("{e:#}"), "join attempt failed; retrying");
                                 }
                             }
                         }
@@ -534,7 +534,7 @@ pub async fn orchestrate(
                             info!("set already initiated on this node");
                         }
                         Err(e) => {
-                            error!(error = %e, "replSetInitiate failed; retrying");
+                            error!(error = %format!("{e:#}"), "replSetInitiate failed; retrying");
                             telemetry.send(TelemetryEvent::ComponentError {
                                 component: "mongo-wrapper".to_string(),
                                 error: e.to_string(),
@@ -612,7 +612,7 @@ async fn member_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemet
                     prune_round(&config, &mongo, &telemetry, &mut gone, gone_dwell).await;
                 }
             }
-            Err(e) => debug!(error = %e, "hello failed in member loop"),
+            Err(e) => debug!(error = %format!("{e:#}"), "hello failed in member loop"),
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -668,10 +668,12 @@ async fn prune_round(
                     return;
                 }
                 Err(e) => {
-                    warn!(member = %m.host, error = %e, "could not remove departed member; will retry")
+                    warn!(member = %m.host, error = %format!("{e:#}"), "could not remove departed member; will retry")
                 }
             },
-            Err(e) => warn!(member = %m.host, error = %e, "refusing to build the pruned config"),
+            Err(e) => {
+                warn!(member = %m.host, error = %format!("{e:#}"), "refusing to build the pruned config")
+            }
         }
     }
     let _ = config;

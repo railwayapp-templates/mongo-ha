@@ -173,7 +173,9 @@ pub async fn resolver(
                     if read_pin(&data_dir).as_ref() != Some(&pin) {
                         match write_pin(&data_dir, &pin) {
                             Ok(()) => info!("credential pin written"),
-                            Err(e) => error!(error = %e, "could not write the credential pin"),
+                            Err(e) => {
+                                error!(error = %format!("{e:#}"), "could not write the credential pin")
+                            }
                         }
                     }
                 }
@@ -211,7 +213,7 @@ pub async fn resolver(
                         keyfile: boot.keyfile.clone(),
                     };
                     if let Err(e) = write_pin(&data_dir, &pin) {
-                        error!(error = %e, "could not update the credential pin");
+                        error!(error = %format!("{e:#}"), "could not update the credential pin");
                     }
                 }
                 PasswordProbe::AccessDenied => {

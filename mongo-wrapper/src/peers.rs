@@ -72,7 +72,7 @@ pub async fn query_peer(
         Ok(resp) if resp.status().is_success() => match resp.json::<RsState>().await {
             Ok(state) => PeerAnswer::State(state),
             Err(e) => {
-                debug!(host, error = %e, "peer /rs/state returned unparseable body");
+                debug!(host, error = %format!("{e:#}"), "peer /rs/state returned unparseable body");
                 PeerAnswer::NotReady
             }
         },
@@ -81,7 +81,7 @@ pub async fn query_peer(
             PeerAnswer::NotReady
         }
         Err(e) => {
-            debug!(host, error = %e, "peer /rs/state unreachable");
+            debug!(host, error = %format!("{e:#}"), "peer /rs/state unreachable");
             PeerAnswer::Unreachable
         }
     }
@@ -123,7 +123,7 @@ pub async fn fetch_keyfile(
             None
         }
         Err(e) => {
-            debug!(host, error = %e, "peer /rs/keyfile unreachable");
+            debug!(host, error = %format!("{e:#}"), "peer /rs/keyfile unreachable");
             None
         }
     }
