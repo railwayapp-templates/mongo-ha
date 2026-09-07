@@ -81,6 +81,13 @@ async fn main() -> Result<()> {
         "starting mongo-wrapper"
     );
 
+    // Decided before anything spawns: a data dir that already holds a mongod
+    // dataset is an adopted volume (or a returning member) and outranks fresh
+    // nodes in the initiate tie-break. Asking the running server instead is
+    // impossible on a not-yet-initiated replica set member (reads refused).
+    let has_data = config.datadir_is_initialized();
+    info!(has_data, "data directory inspected");
+
     // Credentials for this boot: the volume's pin outranks the environment
     // (see auth_pin.rs). A node with no pin that finds a live set among its
     // peers adopts that set's keyfile instead of deriving its own.
@@ -158,6 +165,7 @@ async fn main() -> Result<()> {
                 config: config.clone(),
                 standalone: false,
                 keyfile: Some(Arc::new(keyfile)),
+                has_data,
             }),
             telemetry.clone(),
         ));
@@ -165,6 +173,7 @@ async fn main() -> Result<()> {
             config.clone(),
             mongo.clone(),
             telemetry.clone(),
+            has_data,
         ));
     } else {
         info!("RS_SEEDS not set (or RS_ENABLED=false) — standalone passthrough mode");
@@ -175,6 +184,7 @@ async fn main() -> Result<()> {
                 config: config.clone(),
                 standalone: true,
                 keyfile: None,
+                has_data,
             }),
             telemetry.clone(),
         ));

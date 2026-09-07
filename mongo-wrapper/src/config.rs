@@ -109,6 +109,18 @@ impl Config {
         self.rs_enabled_flag && self.rs_seeds.is_some()
     }
 
+    /// The upstream entrypoint's own "already initialized" test: any of the
+    /// files a mongod dataset always carries. Checked BEFORE mongod spawns —
+    /// it is the initiate tie-break's `has_data` (an adopted volume outranks
+    /// fresh nodes), and it cannot be asked of a `--replSet` member with no
+    /// config, which refuses every read command.
+    pub fn datadir_is_initialized(&self) -> bool {
+        let dir = std::path::Path::new(&self.data_dir);
+        ["WiredTiger", "journal", "local.0", "storage.bson"]
+            .iter()
+            .any(|f| dir.join(f).exists())
+    }
+
     /// This node as the replica set names it: `host:port`. Must match the
     /// entry the template stamps into every RS_SEEDS.
     pub fn node_id(&self) -> String {

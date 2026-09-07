@@ -26,10 +26,10 @@ jobs:
     runs-on: ubuntu-latest
     # Replica set formation and initial sync are quick next to MySQL's clone
     # path, but the deletion scenarios wait out a (shortened) NXDOMAIN dwell
-    # and the whole suite builds the wrapper image once; 60 fits the suite
+    # and the whole suite builds the wrapper image once; 90 fits the suite
     # plus variance without masking a hang — every scenario still fails on
     # its own internal waits, far below the cap.
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout sources

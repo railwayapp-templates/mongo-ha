@@ -366,30 +366,6 @@ impl Mongo {
         Ok(())
     }
 
-    /// Whether the data dir holds any user database — anything but mongod's
-    /// own admin/local/config. An adopted standalone volume answers true; a
-    /// fresh node whose only content is the root user the entrypoint just
-    /// created answers false.
-    pub async fn has_user_data(&self) -> Result<bool> {
-        let d = self
-            .admin(
-                doc! { "listDatabases": 1, "nameOnly": true },
-                SHORT_COMMAND_TIMEOUT,
-            )
-            .await?;
-        let names: Vec<String> = d
-            .get_array("databases")
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(Bson::as_document)
-                    .filter_map(|db| db.get_str("name").ok())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(has_user_databases(&names))
-    }
-
     /// Standalone mode only: a volume that previously ran as a replica set
     /// member still carries that set's config in `local.system.replset`, and
     /// a later re-conversion would load it — with the OLD membership — the
@@ -423,13 +399,6 @@ impl Mongo {
     pub async fn run_admin(&self, command: Document) -> Result<Document> {
         self.admin(command, RECONFIG_TIMEOUT).await
     }
-}
-
-/// mongod's own system databases — everything else is user data.
-pub fn has_user_databases(names: &[String]) -> bool {
-    names
-        .iter()
-        .any(|n| !matches!(n.as_str(), "admin" | "local" | "config"))
 }
 
 fn bson_int(v: Option<&Bson>) -> Option<i64> {
@@ -549,17 +518,6 @@ mod tests {
             healthy,
             is_self,
         }
-    }
-
-    #[test]
-    fn user_databases_exclude_the_system_ones() {
-        assert!(!has_user_databases(&[]));
-        assert!(!has_user_databases(&[
-            "admin".into(),
-            "local".into(),
-            "config".into()
-        ]));
-        assert!(has_user_databases(&["admin".into(), "app".into()]));
     }
 
     #[test]

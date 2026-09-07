@@ -31,10 +31,13 @@ pub struct RsState {
     pub members: Vec<String>,
     pub members_total: usize,
     pub members_healthy: usize,
-    /// True when this node's data dir holds user databases (anything but
-    /// admin/local/config). An adopted standalone volume outranks fresh nodes
-    /// in the initiate tie-break: a fresh node initiating an empty set over
-    /// it would make the adopted data a joiner's initial-sync casualty.
+    /// True when this node's data dir already held an initialized mongod
+    /// dataset when the container started — an adopted standalone volume (or
+    /// a returning member), never a fresh node the entrypoint just
+    /// initialized. Decided before mongod spawns, from the same files the
+    /// upstream entrypoint checks. It outranks fresh nodes in the initiate
+    /// tie-break: a fresh node initiating an empty set over it would make the
+    /// adopted data a joiner's initial-sync casualty.
     pub has_data: bool,
     pub config_version: Option<i64>,
 }

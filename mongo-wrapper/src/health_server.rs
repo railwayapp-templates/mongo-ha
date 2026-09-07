@@ -46,6 +46,8 @@ pub struct AppState {
     pub standalone: bool,
     /// The keyfile content this node's mongod runs with (None standalone).
     pub keyfile: Option<Arc<String>>,
+    /// Whether the data dir held data at boot — see rs::local_rs_state.
+    pub has_data: bool,
 }
 
 #[derive(Deserialize)]
@@ -142,7 +144,7 @@ async fn rs_state(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             return (StatusCode::SERVICE_UNAVAILABLE, "mongod not answering").into_response();
         }
     }
-    match local_rs_state(&state.mongo, &state.config).await {
+    match local_rs_state(&state.mongo, &state.config, state.has_data).await {
         Ok(s) => (StatusCode::OK, Json(s)).into_response(),
         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "state unavailable").into_response(),
     }

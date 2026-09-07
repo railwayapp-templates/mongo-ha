@@ -27,7 +27,22 @@ FAILED_TESTS=()
 
 log()  { printf '\033[1;34m[e2e]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ ok ]\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
-bad()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILED_TESTS+=("$*"); }
+bad()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); FAILED_TESTS+=("$*"); dump_logs_once; }
+
+# On the first failure of a scenario, print the tail of every live e2e
+# container's log — the only way a CI run's autopsy can name the wrapper's
+# reason (the harness's own lines never can). Once per scenario, bounded, so
+# a cascade of `bad` lines cannot flood the job log.
+DUMPED_THIS_SCENARIO=0
+dump_logs_once() {
+  [ "$DUMPED_THIS_SCENARIO" = "1" ] && return
+  DUMPED_THIS_SCENARIO=1
+  local c
+  for c in $(docker ps -a --filter "label=$LABEL" --format '{{.Names}}' 2>/dev/null); do
+    printf '\033[1;33m[logs]\033[0m ---- %s (last 80 lines) ----\n' "$c"
+    docker logs --tail 80 "$c" 2>&1 | cut -c1-400
+  done
+}
 
 cleanup() {
   [ "${KEEP:-0}" = "1" ] && { log "KEEP=1 — leaving resources up"; return; }
@@ -78,6 +93,11 @@ start_node() {
 }
 
 start_trio() { start_node 1; start_node 2; start_node 3; }
+
+# A scenario that "reuses the running trio" but finds it unhealthy must start
+# over from nothing: re-running start_node against existing container names
+# only produces docker name conflicts on top of the original failure.
+ensure_trio() { teardown_trio; start_trio; }
 
 # Reaps the trio AND any node the scale-up chain added beside it.
 teardown_trio() {
@@ -250,7 +270,7 @@ t_set_forms_and_replicates() {
 
 t_failover_on_primary_pause() {
   log "t_failover_on_primary_pause (reuses the running trio)"
-  set_is_fully_online mongo-1 || { start_trio; wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set to fail over"; return; }; }
+  set_is_fully_online mongo-1 || { ensure_trio; wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set to fail over"; return; }; }
 
   docker pause mongo-1 >/dev/null
   log "primary paused; waiting for election"
@@ -458,7 +478,7 @@ switchover_code() {
 
 t_switchover_promotes_requested_node() {
   log "t_switchover_promotes_requested_node (reuses the running trio)"
-  set_is_fully_online mongo-1 || { teardown_trio; start_trio; wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }; }
+  set_is_fully_online mongo-1 || { ensure_trio; wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }; }
 
   local primary target
   primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)"
@@ -485,7 +505,7 @@ t_switchover_promotes_requested_node() {
 
 t_sigterm_primary_demotes_before_exit() {
   log "t_sigterm_primary_demotes_before_exit (reuses the running trio)"
-  set_is_fully_online mongo-1 || { teardown_trio; start_trio; wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }; }
+  set_is_fully_online mongo-1 || { ensure_trio; wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }; }
 
   local primary
   primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)"
@@ -509,7 +529,7 @@ t_sigterm_primary_demotes_before_exit() {
 
 t_wiped_member_volume_rejoins_fresh() {
   log "t_wiped_member_volume_rejoins_fresh (reuses the running trio)"
-  set_is_fully_online mongo-1 || { teardown_trio; start_trio; wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }; }
+  set_is_fully_online mongo-1 || { ensure_trio; wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }; }
 
   # A member whose volume is lost comes back under the same name with an
   # empty data dir: it is still in the set's config, so the primary delivers
@@ -784,6 +804,7 @@ main() {
 
   for t in "${tests[@]}"; do
     resources
+    DUMPED_THIS_SCENARIO=0
     "$t"
   done
 

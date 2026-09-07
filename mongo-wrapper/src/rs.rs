@@ -89,9 +89,16 @@ pub async fn wait_for_final_mongod(mongo: &Mongo, config: &Config) -> Hello {
 }
 
 /// This node's own /rs/state answer, computed live.
-pub async fn local_rs_state(mongo: &Mongo, config: &Config) -> Result<RsState> {
+///
+/// `has_data` is decided BEFORE mongod spawns (see main.rs): whether the data
+/// dir already held an initialized mongod dataset when this container
+/// started. It cannot be read from the running server: a `--replSet` member
+/// with no config yet refuses every read command ("node is not in primary or
+/// recovering state"), so a `listDatabases`-based answer would keep
+/// `/rs/state` at 503 on every fresh node and freeze the whole initiate
+/// decision — every peer "not ready", nobody ever initiating.
+pub async fn local_rs_state(mongo: &Mongo, config: &Config, has_data: bool) -> Result<RsState> {
     let status = mongo.rs_status().await?;
-    let has_data = mongo.has_user_data().await?;
     let node_id = config.node_id();
     Ok(match status {
         RsStatus::NotInitialized => RsState {
@@ -392,7 +399,12 @@ async fn add_self_through_primary(
 
 /// The main orchestration loop. Returns once this node is a member (any state
 /// but REMOVED); `member_duties` takes over from there.
-pub async fn orchestrate(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemetry>) {
+pub async fn orchestrate(
+    config: Arc<Config>,
+    mongo: Mongo,
+    telemetry: Arc<Telemetry>,
+    my_has_data: bool,
+) {
     let hello = wait_for_final_mongod(&mongo, &config).await;
     info!(
         set_name = ?hello.set_name,
@@ -428,15 +440,6 @@ pub async fn orchestrate(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telem
                 warn!("this node was removed from the set's config; seeking to be re-added");
             }
         }
-
-        let my_has_data = match mongo.has_user_data().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "listDatabases failed; retrying");
-                tokio::time::sleep(POLL_INTERVAL).await;
-                continue;
-            }
-        };
 
         let answers = query_peers(&http, &config, &peer_hosts).await;
         let now = Instant::now();
