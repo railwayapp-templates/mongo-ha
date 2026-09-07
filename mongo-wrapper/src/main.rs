@@ -31,6 +31,7 @@ mod keyfile;
 mod mongo;
 mod peers;
 mod process_manager;
+mod replication_monitor;
 mod rs;
 mod volume_lock;
 

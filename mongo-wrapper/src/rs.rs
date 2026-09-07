@@ -49,9 +49,10 @@ use crate::mongo::{
     config_with_member_removed, split_host_port, states, Hello, Mongo, RsStatus,
 };
 use crate::peers::{fetch_keyfile, query_peer, PeerAnswer, RsState};
+use crate::replication_monitor::{self, MemberObservation, MemberStateTracker};
 use anyhow::{Context, Result};
 use common::{Telemetry, TelemetryEvent};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
@@ -100,6 +101,15 @@ pub async fn wait_for_final_mongod(mongo: &Mongo, config: &Config) -> Hello {
 pub async fn local_rs_state(mongo: &Mongo, config: &Config, has_data: bool) -> Result<RsState> {
     let status = mongo.rs_status().await?;
     let node_id = config.node_id();
+    // Read fresh on every call, same as `rs_config` below — cheap (two
+    // capped-collection reads bounded by SHORT_COMMAND_TIMEOUT) and this
+    // endpoint is polled, not streamed, so there is no cache to keep warm.
+    let oplog_window_seconds = mongo
+        .oplog_window()
+        .await
+        .ok()
+        .flatten()
+        .map(|d| d.as_secs());
     Ok(match status {
         RsStatus::NotInitialized => RsState {
             node_id,
@@ -114,6 +124,7 @@ pub async fn local_rs_state(mongo: &Mongo, config: &Config, has_data: bool) -> R
             voting_members: None,
             has_data,
             config_version: None,
+            oplog_window_seconds,
         },
         RsStatus::Active {
             set_name,
@@ -146,6 +157,7 @@ pub async fn local_rs_state(mongo: &Mongo, config: &Config, has_data: bool) -> R
                 voting_members,
                 has_data,
                 config_version,
+                oplog_window_seconds,
             }
         }
     })
@@ -579,6 +591,8 @@ async fn member_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemet
     let mut last_role: Option<String> = None;
     let mut gone = GoneTracker::new();
     let gone_dwell = Duration::from_secs(config.peer_gone_dwell_seconds);
+    let mut member_states = MemberStateTracker::new();
+    let mut replication_alerts: HashSet<String> = HashSet::new();
     loop {
         match mongo.hello().await {
             Ok(h) => {
@@ -610,6 +624,13 @@ async fn member_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemet
                 last_role = Some(role);
                 if h.is_writable_primary {
                     prune_round(&config, &mongo, &telemetry, &mut gone, gone_dwell).await;
+                    replication_health_round(
+                        &mongo,
+                        &telemetry,
+                        &mut member_states,
+                        &mut replication_alerts,
+                    )
+                    .await;
                 }
             }
             Err(e) => debug!(error = %format!("{e:#}"), "hello failed in member loop"),
@@ -677,6 +698,75 @@ async fn prune_round(
         }
     }
     let _ = config;
+}
+
+/// On the primary: sample this node's own oplog window plus every member's
+/// reported state and last-applied optime from the same `replSetGetStatus`
+/// view `prune_round` already reads, and emit telemetry when a member
+/// crosses one of `replication_monitor`'s thresholds (stuck in
+/// RECOVERING/STARTUP2, lag eating the primary's oplog window, or the window
+/// itself shrinking below the floor). Observation only — see
+/// replication_monitor's module doc for why this stops at reporting.
+///
+/// `alerted` dedupes by `ReplicationSignal::dedupe_key`: a signal fires once
+/// when it starts being true and stays quiet on every following poll while
+/// it remains true, then can fire again once it has cleared and recurs — the
+/// same incident-scoped shape `health_server`'s supervised restart telemetry
+/// already uses (`alerted_for_current_incident`), just keyed per signal
+/// instead of a single bool.
+async fn replication_health_round(
+    mongo: &Mongo,
+    telemetry: &Telemetry,
+    member_states: &mut MemberStateTracker,
+    alerted: &mut HashSet<String>,
+) {
+    let Ok(RsStatus::Active { members, .. }) = mongo.rs_status().await else {
+        return;
+    };
+    let oplog_window = match mongo.oplog_window().await {
+        Ok(w) => w,
+        Err(e) => {
+            debug!(error = %format!("{e:#}"), "could not read this node's oplog window");
+            None
+        }
+    };
+
+    let now = Instant::now();
+    let hosts: Vec<String> = members.iter().map(|m| m.host.clone()).collect();
+    let observations: Vec<MemberObservation> = members
+        .iter()
+        .map(|m| MemberObservation {
+            host: m.host.clone(),
+            state_str: m.state_str.clone(),
+            optime_secs: m.optime_secs,
+            is_self: m.is_self,
+            dwell: member_states.observe(&m.host, &m.state_str, now),
+        })
+        .collect();
+    member_states.retain_known(&hosts);
+
+    let primary_optime_secs = members
+        .iter()
+        .find(|m| m.state == states::PRIMARY)
+        .and_then(|m| m.optime_secs);
+
+    let signals =
+        replication_monitor::derive_signals(oplog_window, primary_optime_secs, &observations);
+
+    let mut still_active = HashSet::with_capacity(signals.len());
+    for signal in &signals {
+        let key = signal.dedupe_key();
+        still_active.insert(key.clone());
+        if alerted.insert(key) {
+            warn!(context = signal.context(), message = %signal.message(), "replication health signal");
+            telemetry.send(TelemetryEvent::ComponentError {
+                component: "mongo-wrapper".to_string(),
+                error: signal.message(),
+                context: signal.context().to_string(),
+            });
+        }
+    }
+    alerted.retain(|k| still_active.contains(k));
 }
 
 /// Standalone mode: wait for mongod, then clear any replica set config a
@@ -861,6 +951,7 @@ mod tests {
             voting_members: None,
             has_data,
             config_version: None,
+            oplog_window_seconds: None,
         };
         assert_eq!(
             standing_of(&PeerAnswer::State(state(true, true))),
