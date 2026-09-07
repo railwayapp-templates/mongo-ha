@@ -48,7 +48,7 @@ use crate::mongo::{
     codes, command_error_code, config_member_hosts, config_with_member_added,
     config_with_member_removed, split_host_port, states, Hello, Mongo, RsStatus,
 };
-use crate::peers::{query_peer, PeerAnswer, RsState};
+use crate::peers::{fetch_keyfile, query_peer, PeerAnswer, RsState};
 use anyhow::{Context, Result};
 use common::{Telemetry, TelemetryEvent};
 use std::collections::HashMap;
@@ -291,6 +291,49 @@ async fn query_peers(
         }
     }
     answers
+}
+
+/// One round over the declared peers, BEFORE mongod spawns on a node with no
+/// credential pin: if any peer already holds a set, this node must run with
+/// THAT set's keyfile — its own derivation from RS_KEY may no longer match
+/// (the variable drifted since the set formed). The peer hands the keyfile
+/// out only against the root password it can verify locally. None when no
+/// peer holds a set, none answers, or none accepts the credentials — the
+/// caller then derives from the environment, exactly the pre-pin behavior.
+pub async fn discover_live_set_keyfile(config: &Config) -> Option<String> {
+    let http = reqwest::Client::new();
+    let peer_hosts = config.peer_hosts();
+    if peer_hosts.is_empty() {
+        return None;
+    }
+    let timeout = Duration::from_millis(config.peer_query_timeout_ms);
+    let answers = query_peers(&http, config, &peer_hosts).await;
+    for (host, answer) in &answers {
+        if !matches!(
+            answer,
+            PeerAnswer::State(RsState {
+                set_active: true,
+                ..
+            })
+        ) {
+            continue;
+        }
+        if let Some(keyfile) = fetch_keyfile(
+            &http,
+            host,
+            config.health_port,
+            timeout,
+            &config.mongo_root_username,
+            &config.mongo_root_password,
+        )
+        .await
+        {
+            info!(%host, "adopted the live set's keyfile from a peer");
+            return Some(keyfile);
+        }
+        warn!(%host, "peer holds a set but did not hand out its keyfile; falling back to RS_KEY");
+    }
+    None
 }
 
 /// Add this node to the live set through its primary. `Ok(true)` when a

@@ -22,6 +22,7 @@
 //! This is the state a reverted (HA → standalone) service runs in while it
 //! still uses this image.
 
+mod auth_pin;
 mod config;
 mod demote_on_shutdown;
 mod dns_probe;
@@ -38,7 +39,7 @@ use common::{init_logging, Telemetry, TelemetryEvent};
 use config::Config;
 use health_server::AppState;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -80,10 +81,45 @@ async fn main() -> Result<()> {
         "starting mongo-wrapper"
     );
 
+    // Credentials for this boot: the volume's pin outranks the environment
+    // (see auth_pin.rs). A node with no pin that finds a live set among its
+    // peers adopts that set's keyfile instead of deriving its own.
+    let pin = auth_pin::read_pin(&config.data_dir);
+    if pin.is_none()
+        && std::path::Path::new(&config.data_dir)
+            .join(auth_pin::PIN_FILE)
+            .exists()
+    {
+        warn!("credential pin exists but does not parse; running on the environment's values");
+    }
+    let live_set_keyfile =
+        if config.rs_enabled() && pin.as_ref().is_none_or(|p| p.keyfile.is_none()) {
+            rs::discover_live_set_keyfile(&config).await
+        } else {
+            None
+        };
+    let creds = auth_pin::resolve_boot_credentials(
+        pin.as_ref(),
+        &config.mongo_root_password,
+        config
+            .rs_enabled()
+            .then_some(config.rs_key.as_deref())
+            .flatten(),
+        live_set_keyfile.as_deref(),
+    );
+    if creds.env_drifted {
+        // Reported again, with the verdict, by the resolver once mongod
+        // answers; this is the boot-time heads-up.
+        warn!(
+            "the environment's root password / RS_KEY differ from this volume's credential pin; \
+             booting on the pinned values (the variables only initialize a fresh data dir)"
+        );
+    }
+
     let mongo = mongo::Mongo::connect_local(
         config.mongo_port,
         &config.mongo_root_username,
-        &config.mongo_root_password,
+        &creds.password,
     );
 
     // Flags this wrapper owns, ahead of any CLI args passed through. The
@@ -103,11 +139,11 @@ async fn main() -> Result<()> {
     }
 
     if config.rs_enabled() {
-        let rs_key = config
-            .rs_key
-            .as_deref()
-            .expect("HA mode requires RS_KEY (validated in Config::from_env)");
-        keyfile::write_keyfile(&config.keyfile_path, rs_key)?;
+        let keyfile = creds
+            .keyfile
+            .clone()
+            .expect("HA mode always resolves a keyfile (RS_KEY is validated in Config::from_env)");
+        keyfile::write_keyfile_content(&config.keyfile_path, &keyfile)?;
         flags.extend([
             "--replSet".to_string(),
             config.rs_name.clone(),
@@ -121,6 +157,7 @@ async fn main() -> Result<()> {
                 mongo: mongo.clone(),
                 config: config.clone(),
                 standalone: false,
+                keyfile: Some(Arc::new(keyfile)),
             }),
             telemetry.clone(),
         ));
@@ -137,6 +174,7 @@ async fn main() -> Result<()> {
                 mongo: mongo.clone(),
                 config: config.clone(),
                 standalone: true,
+                keyfile: None,
             }),
             telemetry.clone(),
         ));
@@ -146,6 +184,16 @@ async fn main() -> Result<()> {
             telemetry.clone(),
         ));
     }
+
+    // Proves the boot credentials against the live server, writes the pin,
+    // and follows a properly rotated password (see auth_pin::resolver).
+    tokio::spawn(auth_pin::resolver(
+        config.data_dir.clone(),
+        config.mongo_root_password.clone(),
+        creds.clone(),
+        mongo.clone(),
+        telemetry.clone(),
+    ));
 
     // MONGO_INITDB_ROOT_USERNAME/PASSWORD reach docker-entrypoint.sh through
     // the inherited process environment, not as CLI args.

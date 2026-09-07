@@ -61,6 +61,8 @@ decisions:
   its own status.
 - `GET /rs/state` — peer exchange (JSON): whether this node holds a set, its
   primary, whether it holds user data. Consumed by peers' initiate guards.
+- `POST /rs/keyfile` — the set's keyfile, to a caller that proves the root
+  password (JSON `{username, password}`, verified against this node's mongod).
 - `POST /switchover` — ask THIS node to become the primary (Railway's
   "Make Leader"). Freezes the other secondaries, steps the current primary
   down with a catch-up window, and answers 200 once this node has won.
@@ -108,6 +110,17 @@ The `mongo-wrapper` binary (one per data node):
 - **Demote on shutdown.** On SIGTERM a primary runs `replSetStepDown` with a
   catch-up window before mongod is signaled, so a planned redeploy is a
   handoff, not a detection-timeout failover.
+- **Credential pin.** `MONGO_INITDB_ROOT_PASSWORD` only initializes a fresh
+  data dir, and `RS_KEY` (the keyfile's source) is stamped as a reference to
+  it — so an edit of the variable would otherwise lock the wrapper out of its
+  own mongod and, on the next redeploy, hand each member a keyfile the others
+  refuse. The wrapper pins the password it PROVED against mongod and the
+  keyfile the set runs with on the volume (`.railway-mongo-auth-pin`); a pin
+  outranks the environment at boot, the drift is logged and reported, and a
+  properly rotated stored user (`db.changeUserPassword`, then the variable)
+  is adopted live. A node with no pin that finds a live set adopts that set's
+  keyfile from a peer over `POST /rs/keyfile`, which hands it out only
+  against a root password the peer verifies on its own mongod.
 - **Standalone mode.** Without `RS_SEEDS` (or with `RS_ENABLED=false`, which
   the revert flow sets) mongod runs with no `--replSet`, exactly as the
   upstream image would. A replica set config left in the `local` database by
@@ -161,7 +174,9 @@ Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml
   replication, failover on primary pause, cold restart, switchover, demote
   on SIGTERM, wiped-volume rejoin, standalone-volume conversion, scale-up
   to 5, minority-partition write fence, paused-vs-deleted member pruning,
-  revert-and-reconvert, and the RS_KEY boot guard. Runs on every pull
+  revert-and-reconvert, a root-password edit without rotation (pin keeps the
+  set together) plus a proper rotation (pin follows), a fresh member joining
+  with a drifted RS_KEY, and the RS_KEY boot guard. Runs on every pull
   request.
 
 ## Status

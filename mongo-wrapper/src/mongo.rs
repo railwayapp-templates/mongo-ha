@@ -13,7 +13,9 @@ use mongodb::options::{
     ClientOptions, Credential, ReadPreference, SelectionCriteria, ServerAddress,
 };
 use mongodb::Client;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 const SHORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// A reconfig may wait for the previous config to commit across a majority.
@@ -86,7 +88,54 @@ pub mod states {
 
 #[derive(Clone)]
 pub struct Mongo {
-    client: Client,
+    host: String,
+    port: u16,
+    username: String,
+    /// Swappable: built with the boot-time password (the pin's, when one
+    /// exists), and replaced by the credential resolver once it has proven a
+    /// different password against the live server (see auth_pin.rs). Every
+    /// clone of this handle observes the swap.
+    client: Arc<RwLock<Client>>,
+}
+
+const PASSWORD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outcome of a single-connection authentication probe, distinguishing "the
+/// password is wrong" from "mongod is not up yet" — the credential resolver
+/// must never treat a booting server as a credential verdict.
+#[derive(Debug)]
+pub enum PasswordProbe {
+    Works,
+    AccessDenied,
+    NotReady(String),
+}
+
+/// Try one throwaway connection with the given credentials. Kept off the
+/// shared pool on purpose: probing candidates must not poison it.
+pub async fn probe_password(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+) -> PasswordProbe {
+    let client = client_for(host, port, username, password, true);
+    let attempt = tokio::time::timeout(
+        PASSWORD_PROBE_TIMEOUT,
+        client.database("admin").run_command(doc! { "ping": 1 }),
+    )
+    .await;
+    let outcome = match attempt {
+        Ok(Ok(_)) => PasswordProbe::Works,
+        Ok(Err(e)) => match e.kind.as_ref() {
+            ErrorKind::Authentication { .. } => PasswordProbe::AccessDenied,
+            // 18 = AuthenticationFailed, the server's own verdict.
+            ErrorKind::Command(c) if c.code == 18 => PasswordProbe::AccessDenied,
+            _ => PasswordProbe::NotReady(e.to_string()),
+        },
+        Err(_) => PasswordProbe::NotReady("probe timed out".to_string()),
+    };
+    client.shutdown().await;
+    outcome
 }
 
 /// The error code of a server-side command failure, if that is what `e` is.
@@ -147,8 +196,31 @@ impl Mongo {
     /// socket is opened until the first command.
     pub fn connect_local(port: u16, username: &str, password: &str) -> Self {
         Self {
-            client: client_for("127.0.0.1", port, username, password, true),
+            host: "127.0.0.1".to_string(),
+            port,
+            username: username.to_string(),
+            client: Arc::new(RwLock::new(client_for(
+                "127.0.0.1",
+                port,
+                username,
+                password,
+                true,
+            ))),
         }
+    }
+
+    /// Replace the pooled client with one authenticating as `password`. The
+    /// credential resolver calls this once a candidate is PROVEN against the
+    /// live server, never speculatively.
+    pub async fn swap_password(&self, password: &str) {
+        let fresh = client_for(&self.host, self.port, &self.username, password, true);
+        let old = std::mem::replace(&mut *self.client.write().await, fresh);
+        old.shutdown().await;
+    }
+
+    /// Probe this handle's own server with a candidate password.
+    pub async fn probe_local_password(&self, password: &str) -> PasswordProbe {
+        probe_password(&self.host, self.port, &self.username, password).await
     }
 
     /// A direct connection to another member, for the operations that must
@@ -156,7 +228,12 @@ impl Mongo {
     pub fn connect_member(addr: &str, username: &str, password: &str) -> Self {
         let (host, port) = split_host_port(addr);
         Self {
-            client: client_for(&host, port, username, password, true),
+            client: Arc::new(RwLock::new(client_for(
+                &host, port, username, password, true,
+            ))),
+            host,
+            port,
+            username: username.to_string(),
         }
     }
 
@@ -166,7 +243,8 @@ impl Mongo {
             .next()
             .cloned()
             .unwrap_or_else(|| "?".to_string());
-        tokio::time::timeout(timeout, self.client.database("admin").run_command(command))
+        let client = self.client.read().await.clone();
+        tokio::time::timeout(timeout, client.database("admin").run_command(command))
             .await
             .map_err(|_| anyhow!("{name} timed out after {timeout:?}"))?
             .map_err(|e| anyhow::Error::new(e).context(format!("{name} failed")))
@@ -319,7 +397,7 @@ impl Mongo {
     /// a clean standalone is to drop the `local` database; this does exactly
     /// that, and only when such a config exists. Returns whether it did.
     pub async fn drop_stale_replset_config(&self) -> Result<bool> {
-        let local = self.client.database("local");
+        let local = self.client.read().await.clone().database("local");
         let count = tokio::time::timeout(
             SHORT_COMMAND_TIMEOUT,
             local

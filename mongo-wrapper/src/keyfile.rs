@@ -32,13 +32,20 @@ pub fn derive_keyfile_content(shared_secret: &str) -> String {
 
 /// Write the keyfile for `shared_secret` at `path`, readable only by the
 /// mongod user. Errors are fatal: HA mode cannot start without it.
+#[allow(dead_code)]
 pub fn write_keyfile(path: &str, shared_secret: &str) -> Result<()> {
+    write_keyfile_content(path, &derive_keyfile_content(shared_secret))
+}
+
+/// Write already-resolved keyfile content (a pinned or peer-provided key, see
+/// auth_pin.rs) at `path`, readable only by the mongod user.
+pub fn write_keyfile_content(path: &str, content: &str) -> Result<()> {
     let path = Path::new(path);
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)
             .with_context(|| format!("could not create keyfile directory {}", dir.display()))?;
     }
-    fs::write(path, derive_keyfile_content(shared_secret))
+    fs::write(path, content)
         .with_context(|| format!("could not write keyfile {}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o400))
         .with_context(|| format!("could not chmod keyfile {}", path.display()))?;

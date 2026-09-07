@@ -76,3 +76,45 @@ pub async fn query_peer(
         }
     }
 }
+
+#[derive(Serialize)]
+struct KeyfileRequest<'a> {
+    username: &'a str,
+    password: &'a str,
+}
+
+/// Ask a peer for the keyfile its set runs with, proving the root password
+/// (the peer verifies it against its own mongod before answering — see
+/// health_server::rs_keyfile). None on any refusal or transport failure.
+pub async fn fetch_keyfile(
+    client: &reqwest::Client,
+    host: &str,
+    health_port: u16,
+    timeout: Duration,
+    username: &str,
+    password: &str,
+) -> Option<String> {
+    let url = format!("http://{host}:{health_port}/rs/keyfile");
+    match client
+        .post(&url)
+        .timeout(timeout)
+        .json(&KeyfileRequest { username, password })
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => resp
+            .text()
+            .await
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        Ok(resp) => {
+            debug!(host, status = %resp.status(), "peer /rs/keyfile refused");
+            None
+        }
+        Err(e) => {
+            debug!(host, error = %e, "peer /rs/keyfile unreachable");
+            None
+        }
+    }
+}

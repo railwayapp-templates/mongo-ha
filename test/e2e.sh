@@ -639,6 +639,107 @@ t_revert_to_standalone_and_reconvert() {
   [ "$v" = "standalone-write" ] && ok "standalone-era write reached a fresh replica" || bad "standalone-era write missing on replica (got '$v')"
 }
 
+# restart_node_with_env <n> <extra docker args...> — re-creates mongo-N on its
+# EXISTING volume with a different environment (the shape of a variable edit
+# followed by a redeploy). Uses the same defaults as start_node, overridden by
+# whatever the caller passes (later -e wins in docker run).
+restart_node_with_env() {
+  local n="$1"; shift
+  docker rm -f "mongo-$n" >/dev/null 2>&1
+  docker run -d --label "$LABEL" --restart unless-stopped \
+    --name "mongo-$n" --hostname "mongo-$n" \
+    --network "$NET" --network-alias "mongo-$n" \
+    -v "mongo-ha-e2e-vol-$n:/data/db" \
+    -e MONGO_INITDB_ROOT_USERNAME="$ROOT_USER" \
+    -e MONGO_INITDB_ROOT_PASSWORD="$ROOT_PW" \
+    -e RS_KEY="$RS_KEY" \
+    -e RS_NAME="$RS_NAME" \
+    -e RS_SEEDS="$SEEDS" \
+    -e RAILWAY_PRIVATE_DOMAIN="mongo-$n" \
+    -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
+    -e RAILWAY_VOLUME_MOUNT_PATH="/data/db" \
+    -e BOOTSTRAP_DWELL_SECONDS=5 \
+    "$@" \
+    "$IMAGE" >/dev/null
+}
+
+t_password_variable_edit_does_not_rotate() {
+  log "t_password_variable_edit_does_not_rotate (fresh trio)"
+  teardown_trio
+  start_trio
+  wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }
+  wait_until 60 "credential pin written on every node" \
+    bash -c 'for n in 1 2 3; do docker exec mongo-$n test -s /data/db/.railway-mongo-auth-pin || exit 1; done' \
+    || { bad "credential pin never written"; return; }
+  ok "credential pin written on every node once the password was proven"
+  mongo mongo-1 'db.getSiblingDB("t").kv.replaceOne({_id: 20}, {_id: 20, v: "before-edit"}, {upsert: true})' >/dev/null
+
+  # The edit: MONGO_INITDB_ROOT_PASSWORD (and RS_KEY, which the template
+  # derives from it) change in the environment; the stored user does not.
+  # Roll every node onto the new environment, secondaries first.
+  local primary others n
+  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)"
+  others="$(printf 'mongo-1\nmongo-2\nmongo-3\n' | grep -v "^$primary$" | tr '\n' ' ')"
+  for n in $others $primary; do
+    restart_node_with_env "${n#mongo-}" -e MONGO_INITDB_ROOT_PASSWORD="edited-pw" -e RS_KEY="edited-pw"
+    wait_until 300 "$n back in the set" set_is_fully_online "$n" || { bad "$n did not come back after the env edit"; return; }
+  done
+  ok "every member rejoined after the environment edit (pinned keyfile still shared)"
+
+  # The OLD password is the one mongod enforces — and the one the wrapper uses.
+  local v
+  v="$(mongo mongo-1 'db.getSiblingDB("t").kv.findOne({_id: 20}).v')"
+  [ "$v" = "before-edit" ] && ok "old root password still authenticates; data intact" || bad "old password lost or data missing (got '$v')"
+  wait_until 60 "exactly one primary after the roll" exactly_one_primary mongo-2 mongo-1 mongo-2 mongo-3 \
+    && ok "/role fence intact after the roll (wrapper still authenticated)" || bad "no single /role 200 after the roll"
+  if node_logged mongo-1 "differ from this volume's credential pin"; then
+    ok "drift between environment and pin logged at boot"
+  else
+    bad "no credential-drift warning logged"
+  fi
+  wait_until 90 "drift verdict logged by the resolver" bash -c 'docker logs mongo-1 2>&1 | grep -F "differs from the password mongod" >/dev/null' \
+    && ok "resolver reported the unrotated edit" || bad "resolver never reported the drift"
+
+  # A proper rotation: change the stored user to the environment's value; the
+  # resolver adopts it and re-pins, no restart.
+  mongo "$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" 'db.getSiblingDB("admin").changeUserPassword("'"$ROOT_USER"'", "edited-pw")' >/dev/null
+  wait_until 120 "resolver adopts the rotated password" \
+    bash -c 'for n in 1 2 3; do docker exec mongo-$n grep -q "\"password\":\"edited-pw\"" /data/db/.railway-mongo-auth-pin || exit 1; done' \
+    && ok "pin adopted the properly rotated password on every node" || bad "pin did not follow the proper rotation"
+  wait_until 60 "exactly one primary after rotation" exactly_one_primary mongo-2 mongo-1 mongo-2 mongo-3 \
+    && ok "/role fence intact after the rotation" || bad "fence lost after rotation"
+  # Restore the harness password for later scenarios.
+  ROOT_PW="edited-pw" mongo "$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" 'db.getSiblingDB("admin").changeUserPassword("'"$ROOT_USER"'", "e2e-root-pw")' >/dev/null
+  teardown_trio
+}
+
+t_fresh_member_adopts_live_keyfile() {
+  log "t_fresh_member_adopts_live_keyfile (fresh trio)"
+  teardown_trio
+  start_trio
+  wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }
+
+  # A scale-up node whose RS_KEY does NOT match the set's (the variable was
+  # edited after the set formed): it must fetch the live keyfile from a peer
+  # (proving the root password) instead of deriving a mismatching one.
+  SEEDS_OVERRIDE="$SEEDS,mongo-4:27017" start_node 4 -e RS_KEY="some-other-key"
+  wait_until 300 "4 healthy members" has_n_healthy mongo-1 4 \
+    && ok "fresh member with a drifted RS_KEY joined the set" || bad "fresh member with a drifted RS_KEY did not join"
+  if node_logged mongo-4 "adopted the live set's keyfile from a peer"; then
+    ok "joiner adopted the live set's keyfile over /rs/keyfile"
+  else
+    bad "joiner did not log the keyfile adoption"
+  fi
+  # And the exchange refuses a wrong password.
+  if docker exec mongo-4 wget -q -O /dev/null --header 'Content-Type: application/json' --post-data '{"username":"mongo","password":"wrong"}' http://mongo-1:8080/rs/keyfile 2>/dev/null; then
+    bad "/rs/keyfile handed out the keyfile to a wrong password"
+  else
+    ok "/rs/keyfile refuses a wrong password"
+  fi
+  docker rm -f mongo-4 >/dev/null 2>&1; docker volume rm mongo-ha-e2e-vol-4 >/dev/null 2>&1
+  teardown_trio
+}
+
 t_missing_rs_key_refuses_boot() {
   log "t_missing_rs_key_refuses_boot"
   docker rm -f mongo-nokey >/dev/null 2>&1
@@ -669,6 +770,8 @@ ALL_TESTS=(
   t_paused_member_is_not_pruned
   t_deleted_member_is_pruned
   t_revert_to_standalone_and_reconvert
+  t_password_variable_edit_does_not_rotate
+  t_fresh_member_adopts_live_keyfile
   t_missing_rs_key_refuses_boot
 )
 

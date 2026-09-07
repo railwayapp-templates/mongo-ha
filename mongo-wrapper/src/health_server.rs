@@ -13,6 +13,10 @@
 //!                 node holds a set, who its primary is, whether it holds user
 //!                 data. 503 until the FINAL mongod answers, so a peer
 //!                 mid-boot reads as "not ready", never as "empty and free".
+//!   POST /rs/keyfile — hand the set's keyfile to a node that proves the root
+//!                 password (verified against this node's own mongod). How a
+//!                 fresh member joins after the environment's RS_KEY drifted
+//!                 from what the set runs with (see auth_pin.rs).
 //!   POST /switchover — ask THIS node to become the primary (the generic
 //!                 clusterWiring.dataNodeSwitchover contract). Freezes every
 //!                 other secondary, steps the current primary down with a
@@ -20,7 +24,7 @@
 //!                 election; 200 means it did (which /role then reflects).
 
 use crate::config::Config;
-use crate::mongo::{has_majority, Mongo, RsStatus};
+use crate::mongo::{has_majority, probe_password, Mongo, PasswordProbe, RsStatus};
 use crate::rs::local_rs_state;
 use anyhow::Context;
 use axum::{
@@ -31,6 +35,7 @@ use axum::{
     Json, Router,
 };
 use common::{Telemetry, TelemetryEvent};
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -39,6 +44,50 @@ pub struct AppState {
     pub mongo: Mongo,
     pub config: Arc<Config>,
     pub standalone: bool,
+    /// The keyfile content this node's mongod runs with (None standalone).
+    pub keyfile: Option<Arc<String>>,
+}
+
+#[derive(Deserialize)]
+struct KeyfileRequest {
+    username: String,
+    password: String,
+}
+
+/// The set's keyfile, to a caller that proves the root password against this
+/// node's own mongod. 401 on a wrong password, 503 while mongod cannot judge,
+/// 404 on a standalone node (there is no set to join).
+async fn rs_keyfile(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<KeyfileRequest>,
+) -> impl IntoResponse {
+    let Some(keyfile) = state.keyfile.as_ref() else {
+        return (
+            StatusCode::NOT_FOUND,
+            "not a replica set member".to_string(),
+        );
+    };
+    match probe_password(
+        "127.0.0.1",
+        state.config.mongo_port,
+        &req.username,
+        &req.password,
+    )
+    .await
+    {
+        PasswordProbe::Works => (StatusCode::OK, keyfile.to_string()),
+        PasswordProbe::AccessDenied => {
+            warn!("refused a /rs/keyfile request: authentication failed");
+            (
+                StatusCode::UNAUTHORIZED,
+                "authentication failed".to_string(),
+            )
+        }
+        PasswordProbe::NotReady(e) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("mongod not ready: {e}"),
+        ),
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -234,6 +283,7 @@ async fn run_health_server(health_port: u16, state: Arc<AppState>) -> anyhow::Re
         .route("/health", get(health))
         .route("/role", get(role))
         .route("/rs/state", get(rs_state))
+        .route("/rs/keyfile", post(rs_keyfile))
         .route("/switchover", post(switchover))
         .with_state(state);
 
