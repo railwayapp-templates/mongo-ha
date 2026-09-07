@@ -9,7 +9,9 @@
 use anyhow::{anyhow, bail, Context, Result};
 use mongodb::bson::{doc, Bson, Document};
 use mongodb::error::ErrorKind;
-use mongodb::options::{ClientOptions, Credential, ServerAddress};
+use mongodb::options::{
+    ClientOptions, Credential, ReadPreference, SelectionCriteria, ServerAddress,
+};
 use mongodb::Client;
 use std::time::Duration;
 
@@ -108,6 +110,16 @@ fn client_for(host: &str, port: u16, username: &str, password: &str, direct: boo
             port: Some(port),
         }])
         .direct_connection(direct)
+        // Every connection here is direct, to one server that may well be a
+        // SECONDARY — and a secondary refuses plain reads (listDatabases,
+        // local.system.replset) unless the read preference says anything but
+        // `primary`. PrimaryPreferred keeps the semantics on a primary and
+        // unlocks the same reads on a secondary.
+        .selection_criteria(SelectionCriteria::ReadPreference(
+            ReadPreference::PrimaryPreferred {
+                options: Default::default(),
+            },
+        ))
         .credential(credential)
         .app_name("mongo-wrapper".to_string())
         .server_selection_timeout(SHORT_COMMAND_TIMEOUT)
@@ -358,6 +370,9 @@ pub fn next_config(current: &Document, edit: impl FnOnce(&mut Vec<Bson>)) -> Res
     let mut next = current.clone();
     let version = bson_int(current.get("version")).context("config has no version")?;
     next.insert("version", Bson::Int64(version + 1));
+    // `term` is the primary's to set: sending back the one we read makes the
+    // reconfig fail the moment an election happened in between.
+    next.remove("term");
     let mut members: Vec<Bson> = current
         .get_array("members")
         .context("config has no members")?
@@ -489,12 +504,16 @@ mod tests {
     #[test]
     fn adding_a_member_bumps_version_and_picks_the_next_id() {
         let current = doc! {
-            "_id": "rs0", "version": 3,
+            "_id": "rs0", "version": 3, "term": 7,
             "members": [ { "_id": 0, "host": "a:27017" }, { "_id": 4, "host": "b:27017" } ],
             "settings": { "electionTimeoutMillis": 10000 },
         };
         let next = config_with_member_added(&current, "c:27017").unwrap();
         assert_eq!(bson_int(next.get("version")), Some(4));
+        assert!(
+            next.get("term").is_none(),
+            "term is left for the primary to set"
+        );
         assert_eq!(next.get_str("_id").unwrap(), "rs0");
         assert!(
             next.get_document("settings").is_ok(),
