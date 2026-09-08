@@ -48,6 +48,7 @@ where
 }
 
 /// The `Authorization` header value a caller sends for `cred`.
+#[cfg(test)]
 pub fn basic_header(cred: &Credential) -> String {
     format!(
         "Basic {}",
