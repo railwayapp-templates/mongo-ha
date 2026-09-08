@@ -62,6 +62,7 @@ dump_logs_once() {
 }
 
 cleanup() {
+  rm -f "${HTTP_TRANSCRIPT:-}"
   [ "${KEEP:-0}" = "1" ] && { log "KEEP=1 — leaving resources up"; return; }
   docker ps -aq --filter "label=$LABEL" | xargs -r docker rm -f >/dev/null 2>&1
   docker volume ls -q --filter "label=$LABEL" | xargs -r docker volume rm >/dev/null 2>&1
@@ -195,13 +196,16 @@ rs_state_json() {
 
 # http_code <from-node> <url> [wget args...] — the HTTP status one request
 # got (000 when nothing answered), for the assertions that must tell a 401
-# from a 503. The raw `wget -S` transcript is left in HTTP_OUT for header
-# checks. A POST is `--post-data ''` in the extra args, like switchover_code.
-HTTP_OUT=""
+# from a 503. The raw `wget -S` transcript is left in the HTTP_TRANSCRIPT file
+# for header checks — a file rather than a variable because callers capture
+# the code with `$(http_code ...)`, and a variable set inside that subshell
+# never reaches them. A POST is `--post-data ''` in the extra args, like
+# switchover_code.
+HTTP_TRANSCRIPT="${TMPDIR:-/tmp}/mongo-ha-e2e-http.$$"
 http_code() {
   local from="$1" url="$2"; shift 2
-  HTTP_OUT="$(docker exec "$from" wget -S -O /dev/null "$@" "$url" 2>&1)"
-  printf '%s\n' "$HTTP_OUT" | awk '/^  HTTP\/[0-9.]+ [0-9][0-9][0-9]/{code=$2} END{print (code ? code : "000")}'
+  docker exec "$from" wget -S -O /dev/null "$@" "$url" > "$HTTP_TRANSCRIPT" 2>&1 || true
+  awk '/^  HTTP\/[0-9.]+ [0-9][0-9][0-9]/{code=$2} END{print (code ? code : "000")}' "$HTTP_TRANSCRIPT"
 }
 
 # healthy_members <node> — how many members the node's own view reports
@@ -579,7 +583,7 @@ t_health_api_auth_gates_switchover() {
   code="$(http_code mongo-2 "http://$target:8080/switchover" --post-data '')"
   if [ "$code" = 401 ]; then
     ok "unauthenticated POST /switchover answers 401"
-    printf '%s\n' "$HTTP_OUT" | grep -qi 'WWW-Authenticate: Basic realm="railway-ha"' \
+    grep -qi 'WWW-Authenticate: Basic realm="railway-ha"' "$HTTP_TRANSCRIPT" \
       && ok "401 carries the Basic challenge" || bad "401 without a WWW-Authenticate: Basic challenge"
   else
     bad "unauthenticated POST /switchover answered $code, want 401"
