@@ -20,6 +20,11 @@ ROOT_PW="e2e-root-pw"
 RS_KEY="e2e-shared-key"
 RS_NAME="rs0"
 SEEDS="mongo-1:27017,mongo-2:27017,mongo-3:27017"
+# The health server's HTTP Basic credential (HEALTH_API_USERNAME defaults to
+# `railway`), for the scenario that boots the set with HEALTH_API_PASSWORD.
+HEALTH_API_PW="e2e-health-api-pw"
+HEALTH_API_AUTH="Authorization: Basic $(printf 'railway:%s' "$HEALTH_API_PW" | base64 | tr -d '\n')"
+HEALTH_API_WRONG_AUTH="Authorization: Basic $(printf 'railway:not-the-password' | base64 | tr -d '\n')"
 
 PASS=0
 FAIL=0
@@ -186,6 +191,17 @@ role_code() {
 
 rs_state_json() {
   docker exec "$1" wget -q -O - "http://$2:8080/rs/state" 2>/dev/null
+}
+
+# http_code <from-node> <url> [wget args...] — the HTTP status one request
+# got (000 when nothing answered), for the assertions that must tell a 401
+# from a 503. The raw `wget -S` transcript is left in HTTP_OUT for header
+# checks. A POST is `--post-data ''` in the extra args, like switchover_code.
+HTTP_OUT=""
+http_code() {
+  local from="$1" url="$2"; shift 2
+  HTTP_OUT="$(docker exec "$from" wget -S -O /dev/null "$@" "$url" 2>&1)"
+  printf '%s\n' "$HTTP_OUT" | awk '/^  HTTP\/[0-9.]+ [0-9][0-9][0-9]/{code=$2} END{print (code ? code : "000")}'
 }
 
 # healthy_members <node> — how many members the node's own view reports
@@ -541,6 +557,65 @@ t_switchover_promotes_requested_node() {
   [ "$code" = "200" ] && ok "switchover on the current primary is a 200 no-op" || bad "switchover on the primary returned $code"
 }
 
+# The one mutating route behind HTTP Basic auth: with HEALTH_API_PASSWORD on
+# the data nodes, POST /switchover refuses a missing or wrong credential
+# (401 + challenge) and honors the right one, while every read and the
+# root-password keyfile exchange stay open. Ends by rebuilding the plain trio
+# the following scenarios reuse — which is also the compat half of the
+# contract: with the variable unset the route is open as before.
+t_health_api_auth_gates_switchover() {
+  log "t_health_api_auth_gates_switchover (fresh trio with HEALTH_API_PASSWORD)"
+  teardown_trio
+  start_node 1 -e HEALTH_API_PASSWORD="$HEALTH_API_PW"
+  start_node 2 -e HEALTH_API_PASSWORD="$HEALTH_API_PW"
+  start_node 3 -e HEALTH_API_PASSWORD="$HEALTH_API_PW"
+  wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }
+
+  local primary target code path
+  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)"
+  target="$(printf 'mongo-1\nmongo-2\nmongo-3\n' | grep -v "^$primary$" | tail -1)"
+  log "primary=$primary target=$target"
+
+  code="$(http_code mongo-2 "http://$target:8080/switchover" --post-data '')"
+  if [ "$code" = 401 ]; then
+    ok "unauthenticated POST /switchover answers 401"
+    printf '%s\n' "$HTTP_OUT" | grep -qi 'WWW-Authenticate: Basic realm="railway-ha"' \
+      && ok "401 carries the Basic challenge" || bad "401 without a WWW-Authenticate: Basic challenge"
+  else
+    bad "unauthenticated POST /switchover answered $code, want 401"
+  fi
+  code="$(http_code mongo-2 "http://$target:8080/switchover" --post-data '' --header "$HEALTH_API_WRONG_AUTH")"
+  [ "$code" = 401 ] && ok "wrong credential on POST /switchover answers 401" || bad "wrong credential on POST /switchover answered $code, want 401"
+  [ "$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" = "$primary" ] \
+    && ok "refused switchovers left the primary in place" || bad "primary moved after refused switchovers"
+
+  for path in /health /role /rs/state; do
+    code="$(http_code mongo-2 "http://$primary:8080$path")"
+    [ "$code" = 200 ] && ok "GET $path stays open without a credential" || bad "GET $path answered $code without a credential"
+  done
+  code="$(http_code mongo-2 "http://$primary:8080/rs/keyfile" --header 'Content-Type: application/json' \
+    --post-data "{\"username\":\"$ROOT_USER\",\"password\":\"$ROOT_PW\"}")"
+  [ "$code" = 200 ] && ok "POST /rs/keyfile still answers the root password without a Basic header" \
+    || bad "POST /rs/keyfile with the root password answered $code"
+
+  code="$(http_code mongo-2 "http://$target:8080/switchover" --post-data '' --header "$HEALTH_API_AUTH")"
+  [ "$code" = 200 ] && ok "authenticated POST /switchover answers 200" || bad "authenticated POST /switchover answered $code"
+  wait_until 60 "$target answers /role 200" bash -c "[ \"\$(docker exec mongo-2 wget -q -O /dev/null http://$target:8080/role 2>/dev/null && echo 200 || echo 503)\" = 200 ]" \
+    && ok "requested node is the primary" || bad "requested node did not become primary"
+  wait_until 60 "exactly one primary after switchover" exactly_one_primary mongo-2 mongo-1 mongo-2 mongo-3 \
+    && ok "exactly one primary after switchover" || bad "not exactly one primary after switchover"
+
+  teardown_trio
+  start_trio
+  wait_until 300 "3 healthy (no HEALTH_API_PASSWORD)" set_is_fully_online mongo-1 || { bad "no set after the rebuild"; return; }
+  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)"
+  target="$(printf 'mongo-1\nmongo-2\nmongo-3\n' | grep -v "^$primary$" | tail -1)"
+  code="$(http_code mongo-2 "http://$target:8080/switchover" --post-data '')"
+  [ "$code" = 200 ] && ok "without HEALTH_API_PASSWORD, POST /switchover stays open" || bad "without HEALTH_API_PASSWORD, POST /switchover answered $code"
+  wait_until 60 "exactly one primary after the open switchover" exactly_one_primary mongo-2 mongo-1 mongo-2 mongo-3 \
+    && ok "exactly one primary after the open switchover" || bad "not exactly one primary after the open switchover"
+}
+
 t_sigterm_primary_demotes_before_exit() {
   log "t_sigterm_primary_demotes_before_exit (reuses the running trio)"
   set_is_fully_online mongo-1 || { ensure_trio; wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }; }
@@ -842,6 +917,7 @@ ALL_TESTS=(
   t_failover_on_primary_pause
   t_cold_restart_preserves_set
   t_switchover_promotes_requested_node
+  t_health_api_auth_gates_switchover
   t_sigterm_primary_demotes_before_exit
   t_wiped_member_volume_rejoins_fresh
   t_conversion_adopts_standalone_volume
