@@ -67,6 +67,28 @@ decisions:
   "Make Leader"). Freezes the other secondaries, steps the current primary
   down with a catch-up window, and answers 200 once this node has won.
 
+### Authentication
+
+`POST /switchover` is the one route that changes the set, and it is
+authenticated with the set's own secret: with `HEALTH_API_PASSWORD` set on a
+data node, the route requires `Authorization: Basic
+base64(HEALTH_API_USERNAME:HEALTH_API_PASSWORD)` (username default
+`railway`) and answers `401` with `WWW-Authenticate: Basic
+realm="railway-ha"` to a missing, malformed or wrong credential. The reads
+(`/health`, `/role`, `/rs/state`) never require it — HAProxy's routing probe
+and the peers' initiate guards read them — and `POST /rs/keyfile` keeps its
+own credential, the root password proven against this node's mongod, which
+is the one secret a fresh member is guaranteed to hold.
+
+Unset, the route is open, so a running set adopts enforcement without a
+window where anything fails: callers send the credential whenever the node
+has one, a node that does not enforce yet ignores the header, and the
+variable turns enforcement on node by node as they redeploy. The Railway
+template stamps `HEALTH_API_PASSWORD` as the set's
+`MONGO_INITDB_ROOT_PASSWORD` on every data node, so new sets enforce from
+day one; an existing set enforces once the variable is set on its data
+nodes and they redeploy.
+
 HAProxy's write frontend marks a node UP only while its `/role` returns 200,
 with `default-server fall 2 rise 2 on-marked-down shutdown-sessions` — the
 first failed check switches probing to the fast interval (500ms), so a real
@@ -143,6 +165,8 @@ Data node (`mongo-wrapper`):
 | `RS_NAME` | no | `rs0` | Replica set name (`--replSet`) |
 | `MONGO_PORT` | no | `27017` | Client/replication port |
 | `HEALTH_PORT` | no | `8080` | Wrapper HTTP server |
+| `HEALTH_API_PASSWORD` | no | — | Set → `POST /switchover` requires HTTP Basic auth with it (leading/trailing whitespace ignored); unset → the route is open |
+| `HEALTH_API_USERNAME` | no | `railway` | Username of that credential |
 | `RAILWAY_VOLUME_MOUNT_PATH` / `DATA_DIR` | no | `/data/db` | dbpath |
 | `BOOTSTRAP_DWELL_SECONDS` | no | `15` | How long an initiate verdict must hold |
 | `PEER_GONE_DWELL_SECONDS` | no | `1800` | NXDOMAIN proof length for waiver/prune |
@@ -176,8 +200,10 @@ Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml
   to 5, minority-partition write fence, paused-vs-deleted member pruning,
   revert-and-reconvert, a root-password edit without rotation (pin keeps the
   set together) plus a proper rotation (pin follows), a fresh member joining
-  with a drifted RS_KEY, and the RS_KEY boot guard. Runs on every pull
-  request.
+  with a drifted RS_KEY, the RS_KEY boot guard, and the health server's
+  Basic auth on `POST /switchover` (401 without or with a wrong credential,
+  200 with it, reads and `/rs/keyfile` open, unset = open). Runs on every
+  pull request.
 
 ## Status
 

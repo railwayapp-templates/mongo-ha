@@ -4,7 +4,8 @@
 //!   1. Parse config; take the volume runtime lock.
 //!   2. Derive the keyfile from RS_KEY and write it (keyfile.rs) — BEFORE
 //!      mongod spawns, since `--keyFile` points at it.
-//!   3. Start the health server (/health, /role, /rs/state, /switchover) —
+//!   3. Start the health server (/health, /role, /rs/state, /switchover; the
+//!      last one behind HTTP Basic auth once HEALTH_API_PASSWORD is set) —
 //!      fail-closed until mongod answers.
 //!   4. Spawn `docker-entrypoint.sh mongod --replSet ... --keyFile ...` (args
 //!      passed through) and supervise it: the container lives and dies with
@@ -26,6 +27,7 @@ mod auth_pin;
 mod config;
 mod demote_on_shutdown;
 mod dns_probe;
+mod health_auth;
 mod health_server;
 mod keyfile;
 mod mongo;
@@ -145,6 +147,13 @@ async fn main() -> Result<()> {
         flags.push(config.data_dir.clone());
     }
 
+    // Shared by both modes: the health server's mutating route is gated the
+    // same way whether or not a set is running.
+    let health_api_guard: health_auth::Guard = Arc::new(config.health_api_credential());
+    if health_api_guard.is_some() {
+        info!("HEALTH_API_PASSWORD set: POST /switchover requires HTTP Basic auth");
+    }
+
     if config.rs_enabled() {
         let keyfile = creds
             .keyfile
@@ -167,6 +176,7 @@ async fn main() -> Result<()> {
                 keyfile: Some(Arc::new(keyfile)),
                 has_data,
             }),
+            health_api_guard.clone(),
             telemetry.clone(),
         ));
         tokio::spawn(rs::orchestrate(
@@ -186,6 +196,7 @@ async fn main() -> Result<()> {
                 keyfile: None,
                 has_data,
             }),
+            health_api_guard.clone(),
             telemetry.clone(),
         ));
         tokio::spawn(rs::standalone_duties(

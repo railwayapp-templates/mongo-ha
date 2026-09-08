@@ -15,7 +15,11 @@
 //! both modes: the upstream docker-entrypoint.sh initializes the root account
 //! from them on a fresh data directory, and the wrapper authenticates its own
 //! local admin commands with them.
+//!
+//! HEALTH_API_PASSWORD (with HEALTH_API_USERNAME, default `railway`) gates the
+//! health server's mutating route — see health_auth.rs.
 
+use crate::health_auth::Credential;
 use anyhow::{bail, Context, Result};
 use common::{ConfigExt, RailwayEnv};
 
@@ -45,6 +49,12 @@ pub struct Config {
     /// the keyfile is a function of RS_KEY, never state to preserve.
     pub keyfile_path: String,
     pub health_port: u16,
+    /// Username `POST /switchover` is authenticated as (see health_auth.rs).
+    pub health_api_username: String,
+    /// Password `POST /switchover` requires; None (unset, or only
+    /// whitespace) leaves the route open. Leading/trailing whitespace is
+    /// ignored.
+    pub health_api_password: Option<String>,
     /// This node's private Railway hostname.
     pub private_domain: String,
     /// mongod dbpath — the Railway volume mount. The runtime lock lives here
@@ -85,6 +95,9 @@ impl Config {
             rs_key: non_empty(std::env::var("RS_KEY").ok()),
             keyfile_path: String::env_or("RS_KEYFILE_PATH", "/run/mongo-ha/keyfile"),
             health_port: u16::env_parse("HEALTH_PORT", 8080),
+            health_api_username: String::env_or("HEALTH_API_USERNAME", "railway"),
+            health_api_password: non_empty(std::env::var("HEALTH_API_PASSWORD").ok())
+                .map(|p| p.trim().to_string()),
             private_domain: RailwayEnv::private_domain(),
             data_dir: non_empty(std::env::var("DATA_DIR").ok())
                 .or_else(|| non_empty(std::env::var("RAILWAY_VOLUME_MOUNT_PATH").ok()))
@@ -107,6 +120,17 @@ impl Config {
 
     pub fn rs_enabled(&self) -> bool {
         self.rs_enabled_flag && self.rs_seeds.is_some()
+    }
+
+    /// The credential the health server's mutating route requires; None
+    /// keeps it open.
+    pub fn health_api_credential(&self) -> Option<Credential> {
+        self.health_api_password
+            .as_ref()
+            .map(|password| Credential {
+                username: self.health_api_username.clone(),
+                password: password.clone(),
+            })
     }
 
     /// The upstream entrypoint's own "already initialized" test: any of the
@@ -181,6 +205,8 @@ mod tests {
             rs_key: Some("k".into()),
             keyfile_path: "/run/mongo-ha/keyfile".into(),
             health_port: 8080,
+            health_api_username: "railway".into(),
+            health_api_password: None,
             private_domain: private_domain.into(),
             data_dir: "/data/db".into(),
             peer_query_timeout_ms: 2000,
@@ -218,5 +244,34 @@ mod tests {
         let mut c = config_with_seeds("mongo-1", Some("mongo-1:27017,mongo-2:27017"));
         c.rs_enabled_flag = false;
         assert!(!c.rs_enabled());
+    }
+
+    #[test]
+    fn health_api_credential_follows_the_password() {
+        let mut c = config_with_seeds("mongo-1", None);
+        assert_eq!(c.health_api_credential(), None);
+
+        c.health_api_password = Some("pw".into());
+        assert_eq!(
+            c.health_api_credential(),
+            Some(Credential {
+                username: "railway".into(),
+                password: "pw".into(),
+            })
+        );
+
+        c.health_api_username = "ops".into();
+        assert_eq!(c.health_api_credential().unwrap().username, "ops");
+    }
+
+    #[test]
+    fn health_api_password_env_is_trimmed_and_blank_means_unset() {
+        // Same shape from_env applies: non_empty() then trim().
+        let resolve =
+            |raw: Option<&str>| non_empty(raw.map(str::to_string)).map(|p| p.trim().to_string());
+        assert_eq!(resolve(None), None);
+        assert_eq!(resolve(Some("")), None);
+        assert_eq!(resolve(Some("   ")), None);
+        assert_eq!(resolve(Some(" pw ")), Some("pw".to_string()));
     }
 }
