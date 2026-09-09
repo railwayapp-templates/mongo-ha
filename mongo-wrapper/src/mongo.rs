@@ -5,6 +5,25 @@
 //! 503s instead of hanging them; membership operations (an initiate, a
 //! reconfig, a step-down that waits for a secondary to catch up) get their
 //! own, longer bounds at the call site.
+//!
+//! ## The pooled session and initial sync
+//!
+//! The driver authenticates a pooled connection once, when it is established,
+//! and mongod keeps that connection's user in a session cache. On a member that
+//! joined by INITIAL SYNC the pool logged in as the root user docker-entrypoint
+//! created on this node's fresh volume; the sync then drops `admin` and clones
+//! the set's copy, whose root document carries a different userId. The next
+//! write to `admin.system.users` invalidates mongod's user cache, the session
+//! refresh finds the id changed and logs the connection out
+//! (`AuthorizationManagerImpl::reacquireUser`: "User id from privilege document
+//! does not match user id in session" → UserNotFound → server log id 20245
+//! "Removed deleted user from session cache of user information"), and from
+//! then on every command on that connection fails with code 13 "requires
+//! authentication" — while a fresh connection with the same password
+//! authenticates fine. The driver re-authenticates only on code 391 (OIDC),
+//! never on 13. So `admin` treats a code 13 as a lost session: it rebuilds the
+//! pool with the active password, once per observed pool generation, and
+//! retries the command once.
 
 use anyhow::{anyhow, bail, Context, Result};
 use mongodb::bson::{doc, Bson, Document};
@@ -16,6 +35,7 @@ use mongodb::Client;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 const SHORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// A reconfig may wait for the previous config to commit across a majority.
@@ -36,6 +56,10 @@ pub mod codes {
     pub const NOT_WRITABLE_PRIMARY: i32 = 10107;
     /// `replSetStepDown` found no secondary caught up within the window.
     pub const EXCEEDED_TIME_LIMIT: i32 = 262;
+    /// The connection carries no authenticated user (or lacks a privilege).
+    /// On a pool that authenticated at connection time this means mongod
+    /// logged the session out underneath the driver — see the module doc.
+    pub const UNAUTHORIZED: i32 = 13;
 }
 
 /// What `hello` said about the server behind this connection.
@@ -92,6 +116,14 @@ pub mod states {
     pub const PRIMARY: i32 = 1;
 }
 
+/// The pooled client and how many times it has been replaced. The generation
+/// lets concurrent callers that all saw the same logged-out session agree on
+/// ONE rebuild instead of each replacing the other's fresh pool.
+struct Pool {
+    client: Client,
+    generation: u64,
+}
+
 #[derive(Clone)]
 pub struct Mongo {
     host: String,
@@ -99,13 +131,14 @@ pub struct Mongo {
     username: String,
     /// The password the pooled client currently authenticates with; kept so
     /// a throwaway client (fresh authorization, see drop_stale_replset_config)
-    /// can be built with the same identity.
+    /// and a rebuilt pool can be built with the same identity.
     password: Arc<RwLock<String>>,
     /// Swappable: built with the boot-time password (the pin's, when one
-    /// exists), and replaced by the credential resolver once it has proven a
-    /// different password against the live server (see auth_pin.rs). Every
+    /// exists), replaced by the credential resolver once it has proven a
+    /// different password against the live server (see auth_pin.rs), and
+    /// rebuilt when mongod logs its session out (see the module doc). Every
     /// clone of this handle observes the swap.
-    client: Arc<RwLock<Client>>,
+    pool: Arc<RwLock<Pool>>,
 }
 
 const PASSWORD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -155,6 +188,26 @@ pub fn command_error_code(e: &anyhow::Error) -> Option<i32> {
             ErrorKind::Command(c) => Some(c.code),
             _ => None,
         })
+}
+
+/// A reply saying the connection is not authenticated (code 13). Code 13 also
+/// covers a genuine privilege refusal; that one survives the single retry a
+/// rebuilt pool gets and is returned as is.
+pub fn is_lost_session(e: &anyhow::Error) -> bool {
+    command_error_code(e) == Some(codes::UNAUTHORIZED)
+}
+
+/// One admin command on a given client, bounded by `timeout`.
+async fn run_admin(
+    client: &Client,
+    command: Document,
+    timeout: Duration,
+    name: &str,
+) -> Result<Document> {
+    tokio::time::timeout(timeout, client.database("admin").run_command(command))
+        .await
+        .map_err(|_| anyhow!("{name} timed out after {timeout:?}"))?
+        .map_err(|e| anyhow::Error::new(e).context(format!("{name} failed")))
 }
 
 fn client_for(host: &str, port: u16, username: &str, password: &str, direct: bool) -> Client {
@@ -210,13 +263,10 @@ impl Mongo {
             port,
             username: username.to_string(),
             password: Arc::new(RwLock::new(password.to_string())),
-            client: Arc::new(RwLock::new(client_for(
-                "127.0.0.1",
-                port,
-                username,
-                password,
-                true,
-            ))),
+            pool: Arc::new(RwLock::new(Pool {
+                client: client_for("127.0.0.1", port, username, password, true),
+                generation: 0,
+            })),
         }
     }
 
@@ -225,8 +275,41 @@ impl Mongo {
     /// live server, never speculatively.
     pub async fn swap_password(&self, password: &str) {
         let fresh = client_for(&self.host, self.port, &self.username, password, true);
-        let old = std::mem::replace(&mut *self.client.write().await, fresh);
-        *self.password.write().await = password.to_string();
+        let old = {
+            let mut pool = self.pool.write().await;
+            *self.password.write().await = password.to_string();
+            pool.generation += 1;
+            std::mem::replace(&mut pool.client, fresh)
+        };
+        old.shutdown().await;
+    }
+
+    /// The pooled client and the generation it belongs to.
+    async fn pooled(&self) -> (Client, u64) {
+        let pool = self.pool.read().await;
+        (pool.client.clone(), pool.generation)
+    }
+
+    /// Rebuild the pool after a command on generation `observed` came back
+    /// Unauthorized (see the module doc). A caller that lost the race — the
+    /// pool is already past that generation — does nothing and retries on
+    /// the pool it finds.
+    async fn reauthenticate(&self, observed: u64) {
+        let old = {
+            let mut pool = self.pool.write().await;
+            if pool.generation != observed {
+                return;
+            }
+            let password = self.password.read().await.clone();
+            let fresh = client_for(&self.host, self.port, &self.username, &password, true);
+            pool.generation += 1;
+            warn!(
+                host = %self.host,
+                generation = pool.generation,
+                "mongod dropped the pooled connection's authenticated session (code 13); rebuilt the pool with the active password"
+            );
+            std::mem::replace(&mut pool.client, fresh)
+        };
         old.shutdown().await;
     }
 
@@ -240,9 +323,10 @@ impl Mongo {
     pub fn connect_member(addr: &str, username: &str, password: &str) -> Self {
         let (host, port) = split_host_port(addr);
         Self {
-            client: Arc::new(RwLock::new(client_for(
-                &host, port, username, password, true,
-            ))),
+            pool: Arc::new(RwLock::new(Pool {
+                client: client_for(&host, port, username, password, true),
+                generation: 0,
+            })),
             host,
             port,
             username: username.to_string(),
@@ -256,11 +340,19 @@ impl Mongo {
             .next()
             .cloned()
             .unwrap_or_else(|| "?".to_string());
-        let client = self.client.read().await.clone();
-        tokio::time::timeout(timeout, client.database("admin").run_command(command))
-            .await
-            .map_err(|_| anyhow!("{name} timed out after {timeout:?}"))?
-            .map_err(|e| anyhow::Error::new(e).context(format!("{name} failed")))
+        let (client, generation) = self.pooled().await;
+        match run_admin(&client, command.clone(), timeout, &name).await {
+            Err(e) if is_lost_session(&e) => {
+                // mongod logged this pooled connection out (see the module
+                // doc); a fresh pool authenticates again with the active
+                // password. Retried once: a code 13 that survives a fresh
+                // authentication is a real authorization verdict.
+                self.reauthenticate(generation).await;
+                let (client, _) = self.pooled().await;
+                run_admin(&client, command, timeout, &name).await
+            }
+            outcome => outcome,
+        }
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -396,10 +488,9 @@ impl Mongo {
     pub async fn drop_stale_replset_config(&self) -> Result<bool> {
         let count = tokio::time::timeout(
             SHORT_COMMAND_TIMEOUT,
-            self.client
-                .read()
+            self.pooled()
                 .await
-                .clone()
+                .0
                 .database("local")
                 .collection::<Document>("system.replset")
                 .count_documents(doc! {}),
@@ -675,6 +766,56 @@ mod tests {
             split_host_port("[fd12::1]:27017"),
             ("fd12::1".into(), 27017)
         );
+    }
+
+    /// A driver error carrying a server command failure with `code`, the
+    /// shape `admin` sees (CommandError is non-exhaustive: built through its
+    /// Deserialize impl, wrapped the way `run_admin` wraps it).
+    fn server_error(code: i32, errmsg: &str) -> anyhow::Error {
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
+            "code": code, "codeName": "x", "errmsg": errmsg,
+        })
+        .unwrap();
+        anyhow::Error::new(mongodb::error::Error::from(ErrorKind::Command(command)))
+            .context("replSetGetStatus failed")
+    }
+
+    #[test]
+    fn a_lost_session_is_code_13_and_nothing_else() {
+        assert!(is_lost_session(&server_error(
+            13,
+            "Command replSetGetStatus requires authentication"
+        )));
+        assert!(!is_lost_session(&server_error(
+            94,
+            "no replset config has been received"
+        )));
+        assert!(!is_lost_session(&anyhow!(
+            "replSetGetStatus timed out after 2s"
+        )));
+        assert_eq!(
+            command_error_code(&server_error(13, "x")),
+            Some(codes::UNAUTHORIZED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_session_rebuilds_the_pool_once_per_generation() {
+        let m = Mongo::connect_local(27017, "mongo", "pw");
+        let (_, g0) = m.pooled().await;
+        assert_eq!(g0, 0);
+        // Two callers that observed the same logged-out generation: one
+        // rebuild, not two — the second finds the pool already past it.
+        m.reauthenticate(g0).await;
+        m.reauthenticate(g0).await;
+        assert_eq!(m.pooled().await.1, 1);
+        // A stale observation after the rebuild is a no-op too.
+        m.reauthenticate(g0).await;
+        assert_eq!(m.pooled().await.1, 1);
+        // A proven password swap is a new generation with the new identity.
+        m.swap_password("other").await;
+        assert_eq!(m.pooled().await.1, 2);
+        assert_eq!(*m.password.read().await, "other");
     }
 
     #[test]

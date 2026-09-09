@@ -42,8 +42,10 @@ dump_logs_once() {
     # The wrapper's own lines (JSON with "level") plus mongod's replication,
     # election and control components — the auth/connection chatter the
     # health probes generate every few seconds would otherwise fill the tail.
+    # Log id 20245 ("Removed deleted user from session cache") is the server
+    # logging a pooled connection out, the line that explains a code 13 storm.
     printf '\033[1;33m[logs]\033[0m ---- %s (wrapper + REPL/ELECTION/CONTROL, last 60) ----\n' "$c"
-    docker logs "$c" 2>&1 | grep -E '"level":|"c":"(REPL|ELECTION|CONTROL|STORAGE|-)"' | grep -vE '"id":(20436|6788604|5286306|22943|22944|51800|20883)' | tail -60 | cut -c1-360
+    docker logs "$c" 2>&1 | grep -E '"level":|"c":"(REPL|ELECTION|CONTROL|STORAGE|-)"|"id":20245' | grep -vE '"id":(20436|6788604|5286306|22943|22944|51800|20883)' | tail -60 | cut -c1-360
     if docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null | grep -q true; then
       printf '\033[1;33m[state]\033[0m %s rs.status: ' "$c"
       docker exec "$c" mongosh --quiet "mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin?directConnection=true" \
@@ -188,6 +190,22 @@ rs_state_json() {
   docker exec "$1" wget -q -O - "http://$2:8080/rs/state" 2>/dev/null
 }
 
+# rs_state_settled <probe> <node> — the node's /rs/state answers 200 AND names
+# it PRIMARY or SECONDARY: its wrapper's pooled connection is authenticated
+# against the mongod it supervises, past initial sync. mongosh can say a set is
+# healthy while the wrapper on an initial-synced member is locked out of its own
+# node (code 13 on every pooled command): /rs/state is the wrapper's answer.
+rs_state_settled() {
+  rs_state_json "$1" "$2" | grep -qE '"my_state":"(PRIMARY|SECONDARY)"'
+}
+
+# all_rs_state_settled <probe> <nodes...>
+all_rs_state_settled() {
+  local probe="$1"; shift
+  local n
+  for n in "$@"; do rs_state_settled "$probe" "$n" || return 1; done
+}
+
 # healthy_members <node> — how many members the node's own view reports
 # healthy (states PRIMARY or SECONDARY).
 healthy_members() {
@@ -276,6 +294,23 @@ t_set_forms_and_replicates() {
 
   wait_until 300 "3 healthy members" set_is_fully_online mongo-1 || { bad "set never formed"; return; }
   ok "set formed with 3 healthy members"
+
+  # The WRAPPER on every member must be in too. On the two initial-synced
+  # members mongod logs the pooled connection out once the cloned admin
+  # database replaces the local root (server log id 20245); until the pool is
+  # rebuilt, /rs/state, /role and the orchestrator all fail with code 13, so a
+  # later election can never surface a /role 200 on them.
+  wait_until 60 "every member's /rs/state settled" all_rs_state_settled mongo-2 mongo-1 mongo-2 mongo-3 \
+    && ok "every member's /rs/state answers 200 (wrapper pool authenticated after initial sync)" \
+    || bad "a member's wrapper never reached a settled /rs/state (pooled session lost?)"
+  local n
+  for n in 1 2 3; do
+    wait_until 30 "mongo-$n wrapper logged membership" node_logged "mongo-$n" "member of the replica set" \
+      && ok "mongo-$n wrapper reached member duties" || bad "mongo-$n wrapper never logged membership"
+  done
+  for n in 1 2 3; do
+    log "mongo-$n: $(docker logs "mongo-$n" 2>&1 | grep -c '"id":20245') session drop(s) logged by mongod, $(docker logs "mongo-$n" 2>&1 | grep -c 'rebuilt the pool') pool rebuild(s) by the wrapper"
+  done
 
   # Exactly the seed-order winner (mongo-1) answers /role 200 on a fresh deploy.
   local codes

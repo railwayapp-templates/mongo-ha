@@ -121,6 +121,18 @@ The `mongo-wrapper` binary (one per data node):
   is adopted live. A node with no pin that finds a live set adopts that set's
   keyfile from a peer over `POST /rs/keyfile`, which hands it out only
   against a root password the peer verifies on its own mongod.
+- **Pooled connection after initial sync.** The wrapper's admin connection
+  authenticates once per pooled socket. On a member that joined by initial
+  sync, the root user it logged in as is the one the entrypoint created on the
+  fresh volume; the sync replaces `admin` with the set's copy (a different
+  userId) and mongod logs the session out on the next user-cache refresh
+  (server log id 20245), after which every pooled command fails with code 13
+  "requires authentication" while fresh connections still work. The wrapper
+  treats that code as a lost session: it rebuilds the pool with the active
+  password (once per pool generation, however many callers saw the failure)
+  and retries the command once. Without it an initial-synced member's
+  `/rs/state` and `/role` stay 503 for the life of the process, so an
+  election that promotes it never reaches HAProxy.
 - **Standalone mode.** Without `RS_SEEDS` (or with `RS_ENABLED=false`, which
   the revert flow sets) mongod runs with no `--replSet`, exactly as the
   upstream image would. A replica set config left in the `local` database by
