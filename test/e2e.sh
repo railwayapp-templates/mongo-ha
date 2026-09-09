@@ -793,6 +793,24 @@ t_password_variable_edit_does_not_rotate() {
   teardown_trio
 }
 
+# keyfile_http_code <from-node> <target-node> <username> <password> — the
+# HTTP status POST /rs/keyfile answers those credentials (000 when nothing
+# answered). wget's exit code alone cannot tell a 401 from a 503, and the
+# scenario below must.
+keyfile_http_code() {
+  docker exec "$1" wget -S -O /dev/null --tries=1 --header 'Content-Type: application/json' \
+    --post-data "{\"username\":\"$3\",\"password\":\"$4\"}" "http://$2:8080/rs/keyfile" 2>&1 \
+    | awk '/^  HTTP\/[0-9.]+ [0-9][0-9][0-9]/{code=$2} END{print (code ? code : "000")}'
+}
+
+# The mongosh shell of a NON-root admin user, against a node's own mongod.
+reader_mongo() {
+  local node="$1"; shift
+  docker exec "$node" mongosh --quiet \
+    "mongodb://e2e-reader:e2e-reader-pw@127.0.0.1:27017/admin?directConnection=true&authSource=admin" \
+    --eval "$1" 2>/dev/null
+}
+
 t_fresh_member_adopts_live_keyfile() {
   log "t_fresh_member_adopts_live_keyfile (fresh trio)"
   teardown_trio
@@ -801,7 +819,7 @@ t_fresh_member_adopts_live_keyfile() {
 
   # A scale-up node whose RS_KEY does NOT match the set's (the variable was
   # edited after the set formed): it must fetch the live keyfile from a peer
-  # (proving the root password) instead of deriving a mismatching one.
+  # (proving the root account) instead of deriving a mismatching one.
   SEEDS_OVERRIDE="$SEEDS,mongo-4:27017" start_node 4 -e RS_KEY="some-other-key"
   wait_until 300 "4 healthy members" has_n_healthy mongo-1 4 \
     && ok "fresh member with a drifted RS_KEY joined the set" || bad "fresh member with a drifted RS_KEY did not join"
@@ -810,12 +828,34 @@ t_fresh_member_adopts_live_keyfile() {
   else
     bad "joiner did not log the keyfile adoption"
   fi
-  # And the exchange refuses a wrong password.
-  if docker exec mongo-4 wget -q -O /dev/null --header 'Content-Type: application/json' --post-data '{"username":"mongo","password":"wrong"}' http://mongo-1:8080/rs/keyfile 2>/dev/null; then
-    bad "/rs/keyfile handed out the keyfile to a wrong password"
+
+  # The exchange is for the root account only. The keyfile is the __system
+  # credential — above every role — so a user mongod authenticates on admin
+  # without `root` must get nothing, while the root account gets exactly the
+  # keyfile the peer runs with.
+  local primary code handed live
+  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3 mongo-4)" || { bad "no primary to create the reader user on"; return; }
+  mongo "$primary" 'db.getSiblingDB("admin").createUser({user: "e2e-reader", pwd: "e2e-reader-pw", roles: [{role: "readAnyDatabase", db: "admin"}]})' >/dev/null
+  wait_until 60 "non-root admin user authenticates on mongo-1" \
+    bash -c "[ \"\$(docker exec mongo-1 mongosh --quiet 'mongodb://e2e-reader:e2e-reader-pw@127.0.0.1:27017/admin?directConnection=true&authSource=admin' --eval 'db.runCommand({connectionStatus: 1}).authInfo.authenticatedUsers[0].user' 2>/dev/null)\" = e2e-reader ]" \
+    || { bad "the non-root admin user never authenticated against mongo-1's mongod"; return; }
+  ok "non-root admin user authenticates against mongod (the exchange must still refuse it)"
+  code="$(keyfile_http_code mongo-4 mongo-1 e2e-reader e2e-reader-pw)"
+  [ "$code" = 401 ] && ok "/rs/keyfile refuses a non-root admin user mongod authenticates (401)" \
+    || bad "/rs/keyfile answered $code to a non-root admin user, want 401"
+  code="$(keyfile_http_code mongo-4 mongo-1 "$ROOT_USER" wrong)"
+  [ "$code" = 401 ] && ok "/rs/keyfile refuses a wrong root password (401)" \
+    || bad "/rs/keyfile answered $code to a wrong root password, want 401"
+  handed="$(docker exec mongo-4 wget -q -O - --tries=1 --header 'Content-Type: application/json' \
+    --post-data "{\"username\":\"$ROOT_USER\",\"password\":\"$ROOT_PW\"}" http://mongo-1:8080/rs/keyfile 2>/dev/null)"
+  live="$(docker exec mongo-1 cat /run/mongo-ha/keyfile 2>/dev/null)"
+  if [ -n "$live" ] && [ "$handed" = "$live" ]; then
+    ok "/rs/keyfile hands the root account the keyfile mongo-1 runs with"
   else
-    ok "/rs/keyfile refuses a wrong password"
+    bad "/rs/keyfile gave the root account '${handed:0:12}' (mongo-1 runs with '${live:0:12}')"
   fi
+  mongo "$primary" 'db.getSiblingDB("admin").dropUser("e2e-reader")' >/dev/null
+
   docker rm -f mongo-4 >/dev/null 2>&1; docker volume rm mongo-ha-e2e-vol-4 >/dev/null 2>&1
   teardown_trio
 }
