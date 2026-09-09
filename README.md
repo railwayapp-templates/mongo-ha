@@ -165,8 +165,8 @@ Data node (`mongo-wrapper`):
 | `RS_NAME` | no | `rs0` | Replica set name (`--replSet`) |
 | `MONGO_PORT` | no | `27017` | Client/replication port |
 | `HEALTH_PORT` | no | `8080` | Wrapper HTTP server |
-| `HEALTH_API_PASSWORD` | no | — | Set → `POST /switchover` requires HTTP Basic auth with it (leading/trailing whitespace ignored); unset → the route is open |
-| `HEALTH_API_USERNAME` | no | `railway` | Username of that credential |
+| `HEALTH_API_PASSWORD` | no | — | Set → `POST /switchover` requires HTTP Basic auth with it (leading/trailing whitespace ignored); unset → the route is open; present but blank → treated as unset, with a warning in the boot log |
+| `HEALTH_API_USERNAME` | no | `railway` | Username of that credential (leading/trailing whitespace ignored; blank → `railway`, the same resolution the platform applies) |
 | `RAILWAY_VOLUME_MOUNT_PATH` / `DATA_DIR` | no | `/data/db` | dbpath |
 | `BOOTSTRAP_DWELL_SECONDS` | no | `15` | How long an initiate verdict must hold |
 | `PEER_GONE_DWELL_SECONDS` | no | `1800` | NXDOMAIN proof length for waiver/prune |
