@@ -158,6 +158,17 @@ async fn main() -> Result<()> {
             .clone()
             .expect("HA mode always resolves a keyfile (RS_KEY is validated in Config::from_env)");
         keyfile::write_keyfile_content(&config.keyfile_path, &keyfile)?;
+        // The wrapper's record that this data dir runs as a set member — what
+        // a later standalone boot (a revert) keys its oplog replay on (see
+        // standalone_recovery.rs). Before mongod spawns, so it is there
+        // however that mongod ends.
+        if let Err(e) = standalone_recovery::mark_replset_boot(&config.data_dir, &config.rs_name) {
+            warn!(
+                error = %format!("{e:#}"),
+                "could not record the replica set boot on the volume; a later standalone boot \
+                 falls back to the credential pin to decide the oplog replay"
+            );
+        }
         flags.extend([
             "--replSet".to_string(),
             config.rs_name.clone(),
@@ -187,9 +198,17 @@ async fn main() -> Result<()> {
         // A volume that ran as a set member replays its oplog first (see
         // standalone_recovery.rs); the real standalone mongod below then
         // opens a data dir that already holds every write the set took.
-        if standalone_recovery::replay_needed(has_data, pin.as_ref()) {
+        let marker = standalone_recovery::replset_marker_present(&config.data_dir);
+        if !has_data {
+            // Nothing was ever written under --replSet: a record left by an
+            // HA boot that died before initializing the data dir is void.
+            standalone_recovery::clear_replset_marker(&config.data_dir);
+        } else if standalone_recovery::replay_needed(has_data, marker, pin.as_ref()) {
             match standalone_recovery::replay_oplog_as_standalone(&config, &args).await {
-                Ok(outcome) => info!(?outcome, "starting the standalone mongod"),
+                Ok(outcome) => {
+                    info!(?outcome, "starting the standalone mongod");
+                    standalone_recovery::clear_replset_marker(&config.data_dir);
+                }
                 Err(e) => {
                     // Fail-stop with the data dir untouched: the log carries
                     // the fix, the restart policy retries the boot.

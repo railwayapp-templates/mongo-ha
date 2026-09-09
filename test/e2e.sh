@@ -717,6 +717,8 @@ revert_and_reconvert() {
     && ok "reverted root ran the recovery boot before the standalone mongod" || bad "reverted root skipped the recovery boot"
   node_logged mongo-1 "recovery boot finished" \
     && ok "recovery boot checkpointed and handed over" || bad "recovery boot did not finish"
+  docker exec mongo-1 test ! -e /data/db/.railway-mongo-replset \
+    && ok "replica set boot record cleared once the replay was checkpointed" || bad "replica set boot record still on the volume after the replay"
   wait_until 60 "stale replica set config dropped" bash -c 'docker logs mongo-1 2>&1 | grep -F "dropped the replica set config" >/dev/null' \
     && ok "stale replica set config dropped on revert" || bad "stale replica set config not dropped"
   [ "$(mongo mongo-1 'db.getSiblingDB("local").system.replset.countDocuments({})' | tr -d '[:space:]')" = "0" ] \
@@ -738,13 +740,17 @@ revert_and_reconvert() {
     bad "reverted root refused a write"
   fi
 
-  # Re-convert: RS_SEEDS back on the root, two fresh replicas.
+  # Re-convert: RS_SEEDS back on the root, two fresh replicas. A distinct
+  # phase with its own containers: a failure here gets its own log dump.
+  DUMPED_THIS_SCENARIO=0
   docker rm -f mongo-1 >/dev/null
   start_node 1; start_node 2; start_node 3
   wait_until 300 "3 healthy after re-conversion" set_is_fully_online mongo-1 \
     || { bad "re-conversion did not form a set"; return 1; }
   ok "re-converted from the reverted volume"
   [ "$(role_code mongo-2 mongo-1)" = "200" ] && ok "adopted root is the primary again (its data won the initiate tie-break)" || bad "the reverted root is not the primary after re-conversion"
+  docker exec mongo-1 test -e /data/db/.railway-mongo-replset \
+    && ok "re-converted root records its replica set boot on the volume again" || bad "re-converted root left no replica set boot record"
   v="$(mongo mongo-3 'db.getSiblingDB("t").revert.findOne({_id: 10}).v')"
   [ "$v" = "standalone-write" ] && ok "standalone-era write reached a fresh replica" || bad "standalone-era write missing on replica (got '$v')"
   # A member's boot with --replSet replays natively; a second standalone boot

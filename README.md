@@ -123,8 +123,10 @@ The `mongo-wrapper` binary (one per data node):
   against a root password the peer verifies on its own mongod.
 - **Standalone mode.** Without `RS_SEEDS` (or with `RS_ENABLED=false`, which
   the revert flow sets) mongod runs with no `--replSet`, exactly as the
-  upstream image would. A volume that ran as a replica set member (its
-  credential pin carries a keyfile) first replays its oplog: a member's
+  upstream image would. A volume that ran as a replica set member (every HA
+  boot records it on the volume before mongod spawns; a volume from an older
+  image is recognised by the keyfile in its credential pin) first replays its
+  oplog: a member's
   collections are not journaled — durability is the journaled oplog plus
   stable checkpoints, replayed on every `--replSet` boot — and a boot without
   `--replSet` performs no replay, so after a crash before the redeploy (or

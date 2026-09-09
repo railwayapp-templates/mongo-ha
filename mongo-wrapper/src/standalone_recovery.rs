@@ -45,15 +45,21 @@
 //!
 //! ## When it runs
 //!
-//! Standalone mode, on a data dir that holds a dataset, when the volume's
-//! credential pin carries a keyfile — a keyfile is pinned only by an HA boot,
-//! so it is the wrapper's own record that this dataset ran as a set member.
-//! The signal cannot come from the data dir itself (WiredTiger files are
-//! opaque) and must not be guessed: on a volume that only ever ran standalone
-//! there is no oplog, and the recovery boot is fatal there (log id 31364,
-//! "Recovery not possible, no oplog found"). Once the real standalone mongod
-//! has proven the password, the resolver re-pins without a keyfile, so the
-//! replay runs exactly once per revert.
+//! Standalone mode, on a data dir that holds a dataset, when the wrapper's own
+//! record says the dataset ran under `--replSet`: the marker file every HA
+//! boot writes on the volume before mongod spawns (`REPLSET_MARKER`), or — for
+//! a volume from an image without the marker — a credential pin carrying a
+//! keyfile, which only an HA boot writes. The signal cannot come from the
+//! data dir itself (WiredTiger files are opaque) and must not be guessed: on
+//! a volume that only ever ran standalone there is no oplog, and the recovery
+//! boot is fatal there (log id 31364, "Recovery not possible, no oplog
+//! found"). The marker is cleared once the replay is checkpointed (or found
+//! nothing to replay), and the standalone resolver re-pins without a keyfile,
+//! so the replay runs exactly once per revert. The marker, not the pin, is
+//! the primary signal because the pin is proof-gated: it is written once the
+//! root password has been proven against the live mongod, typically ~30s
+//! into the first boot, and a member reverted before that would have no
+//! record of ever being one.
 //!
 //! ## When it cannot
 //!
@@ -72,13 +78,21 @@ use mongodb::options::{ClientOptions, ServerAddress};
 use mongodb::Client;
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
+use std::fs;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout};
-use tracing::info;
+use tracing::{info, warn};
+
+/// The wrapper's record that mongod has opened this data dir with `--replSet`:
+/// written before every HA-mode spawn (its content is the set name; only its
+/// presence is read), cleared by the standalone boot once the oplog replay is
+/// checkpointed or found nothing to replay.
+pub const REPLSET_MARKER: &str = ".railway-mongo-replset";
 
 /// mongod's fatal assertion when `recoverFromOplogAsStandalone` finds no oplog
 /// to replay ("Recovery not possible, no oplog found",
@@ -98,12 +112,42 @@ const PROGRESS_EVERY: Duration = Duration::from_secs(30);
 /// bound is generous and nothing is ever killed before it.
 const SHUTDOWN_LIMIT: Duration = Duration::from_secs(30 * 60);
 
+fn marker_path(data_dir: &str) -> std::path::PathBuf {
+    Path::new(data_dir).join(REPLSET_MARKER)
+}
+
+/// Record on the volume that mongod is about to open this data dir with
+/// `--replSet` (see REPLSET_MARKER). Called before the spawn, so the record
+/// exists however that mongod ends.
+pub fn mark_replset_boot(data_dir: &str, rs_name: &str) -> Result<()> {
+    let path = marker_path(data_dir);
+    fs::write(&path, rs_name).with_context(|| format!("writing {}", path.display()))
+}
+
+pub fn replset_marker_present(data_dir: &str) -> bool {
+    marker_path(data_dir).exists()
+}
+
+/// Forget the record: the standalone boot has replayed what the oplog held
+/// (or found no oplog), and the data files now stand on their own.
+pub fn clear_replset_marker(data_dir: &str) {
+    let path = marker_path(data_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => info!(path = %path.display(), "replica set boot record cleared"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "could not clear the replica set boot record")
+        }
+    }
+}
+
 /// Whether this standalone boot must replay the oplog first. `has_data`: the
 /// data dir holds a mongod dataset (decided before anything spawns, see
-/// main.rs). `pin`: the volume's credential pin; a keyfile is pinned only by
-/// an HA boot, so it is the record that the dataset ran as a set member.
-pub fn replay_needed(has_data: bool, pin: Option<&AuthPin>) -> bool {
-    has_data && pin.is_some_and(|p| p.keyfile.is_some())
+/// main.rs). `marker_present`: the volume carries REPLSET_MARKER. `pin`: the
+/// volume's credential pin — a keyfile is pinned only by an HA boot, the
+/// record a volume from an image without the marker still carries.
+pub fn replay_needed(has_data: bool, marker_present: bool, pin: Option<&AuthPin>) -> bool {
+    has_data && (marker_present || pin.is_some_and(|p| p.keyfile.is_some()))
 }
 
 /// The mongod flags of the recovery boot. Loopback only: the server is
@@ -396,16 +440,43 @@ mod tests {
             password: "pw".into(),
             keyfile: None,
         };
-        // The revert: an HA volume booting without RS_SEEDS.
-        assert!(replay_needed(true, Some(&member)));
-        // A fresh volume has nothing to replay whatever the pin says.
-        assert!(!replay_needed(false, Some(&member)));
-        assert!(!replay_needed(false, None));
+        // The revert: an HA volume booting without RS_SEEDS — the marker every
+        // HA boot writes is the record, whatever the pin's state (a member
+        // reverted within its first ~30s has no pin yet).
+        assert!(replay_needed(true, true, None));
+        assert!(replay_needed(true, true, Some(&standalone)));
+        // A volume from an image without the marker: the pinned keyfile is
+        // the record.
+        assert!(replay_needed(true, false, Some(&member)));
+        // A fresh volume has nothing to replay whatever the records say.
+        assert!(!replay_needed(false, true, Some(&member)));
+        assert!(!replay_needed(false, false, None));
         // A volume that only ever ran standalone has no oplog: the recovery
         // boot would be fatal there, so it must not run.
-        assert!(!replay_needed(true, Some(&standalone)));
-        // No pin at all (upstream-image volume, torn pin): today's boot.
-        assert!(!replay_needed(true, None));
+        assert!(!replay_needed(true, false, Some(&standalone)));
+        // No record at all (upstream-image volume, torn pin): today's boot.
+        assert!(!replay_needed(true, false, None));
+    }
+
+    #[test]
+    fn the_replset_marker_round_trips_and_clears_quietly() {
+        let dir = std::env::temp_dir().join(format!("mongo-replset-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+        assert!(!replset_marker_present(d));
+        // Clearing an absent record is not an error (every standalone boot of
+        // a fresh volume does it).
+        clear_replset_marker(d);
+        mark_replset_boot(d, "rs0").unwrap();
+        assert!(replset_marker_present(d));
+        assert_eq!(std::fs::read_to_string(marker_path(d)).unwrap(), "rs0");
+        // Rewritten on every HA boot, idempotently.
+        mark_replset_boot(d, "rs0").unwrap();
+        assert!(replset_marker_present(d));
+        clear_replset_marker(d);
+        assert!(!replset_marker_present(d));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
