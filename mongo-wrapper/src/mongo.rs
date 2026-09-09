@@ -108,7 +108,10 @@ pub struct Mongo {
     client: Arc<RwLock<Client>>,
 }
 
-const PASSWORD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The budget of one credential probe against a mongod. Also the floor a
+/// joiner's keyfile fetch must respect: a peer answers `/rs/keyfile` only
+/// after this probe returns (see peers::keyfile_fetch_timeout).
+pub const PASSWORD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Outcome of a single-connection authentication probe, distinguishing "the
 /// password is wrong" from "mongod is not up yet" — the credential resolver

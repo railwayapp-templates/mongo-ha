@@ -6,9 +6,46 @@
 //! boot query and mysql-ha's /gr/state: never trust only local state when
 //! deciding whether a live set exists.
 
+use crate::mongo::PASSWORD_PROBE_TIMEOUT;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::debug;
+
+/// Margin a joiner adds on top of the peer's credential-probe budget when it
+/// asks for the keyfile. The peer answers `/rs/keyfile` only after probing the
+/// password against its own mongod — up to `PASSWORD_PROBE_TIMEOUT` when that
+/// mongod is slow — and the answer still has to cross the network. A fetch
+/// that gives up earlier reads a slow peer as "no answer": the joiner then
+/// derives its keyfile from RS_KEY while the peer was about to hand out the
+/// live one, and joins with a keyfile the set may refuse.
+pub const KEYFILE_FETCH_MARGIN: Duration = Duration::from_secs(2);
+
+/// The per-peer timeout of a keyfile fetch: the configured peer query
+/// timeout, raised to the probe budget plus the margin when it is shorter
+/// (the default 2s `/rs/state` timeout is).
+pub fn keyfile_fetch_timeout(peer_query_timeout: Duration) -> Duration {
+    peer_query_timeout.max(PASSWORD_PROBE_TIMEOUT + KEYFILE_FETCH_MARGIN)
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn a_keyfile_fetch_outlasts_the_peers_probe_budget() {
+        // PEER_QUERY_TIMEOUT_MS defaults to 2000 (config.rs), shorter than the
+        // peer's probe budget; the keyfile fetch must not be.
+        let default_peer_query = Duration::from_millis(2000);
+        assert!(default_peer_query < PASSWORD_PROBE_TIMEOUT);
+        assert!(
+            keyfile_fetch_timeout(default_peer_query)
+                >= PASSWORD_PROBE_TIMEOUT + KEYFILE_FETCH_MARGIN
+        );
+        // A longer configured timeout is kept as it is.
+        let long = Duration::from_secs(30);
+        assert_eq!(keyfile_fetch_timeout(long), long);
+    }
+}
 
 /// A node's self-reported replica set state. Also the /rs/state body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,7 +144,7 @@ pub async fn fetch_keyfile(
     let url = format!("http://{host}:{health_port}/rs/keyfile");
     match client
         .post(&url)
-        .timeout(timeout)
+        .timeout(keyfile_fetch_timeout(timeout))
         .json(&KeyfileRequest { username, password })
         .send()
         .await
