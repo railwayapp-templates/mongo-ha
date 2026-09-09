@@ -197,12 +197,12 @@ async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .map(|m| m.host.clone())
             .collect();
 
+        // Peers are reached with the password this node's own pool runs on
+        // (the pin's, when the volume carries one): the set shares one root
+        // user, and the environment's value may have been edited since.
+        let password = state.mongo.current_password().await;
         let member = |host: &str| {
-            Mongo::connect_member(
-                host,
-                &state.config.mongo_root_username,
-                &state.config.mongo_root_password,
-            )
+            Mongo::connect_member(host, &state.config.mongo_root_username, &password)
         };
         for host in &others {
             if let Err(e) = member(host).freeze(FREEZE_SECS).await {

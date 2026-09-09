@@ -41,6 +41,13 @@
 //!     on the same NXDOMAIN proof, by the primary — so a scale-down shrinks
 //!     the majority requirement instead of leaving ghosts that vote against
 //!     every future election.
+//!   - A node with no credential pin that finds a live set runs with THAT
+//!     set's keyfile, fetched from a settled member against the root password.
+//!     A settled member refusing the password is a credential verdict, not a
+//!     keyfile problem: the node stops with the fix in its log (restore
+//!     MONGO_INITDB_ROOT_PASSWORD, redeploy) instead of deriving a keyfile from
+//!     the edited RS_KEY and looping on a join the set refuses. The same holds
+//!     when the primary refuses the credentials while adding the node.
 
 use crate::config::Config;
 use crate::dns_probe::{probe_name_detailed, NameVerdict};
@@ -303,47 +310,183 @@ async fn query_peers(
     answers
 }
 
-/// One round over the declared peers, BEFORE mongod spawns on a node with no
-/// credential pin: if any peer already holds a set, this node must run with
-/// THAT set's keyfile — its own derivation from RS_KEY may no longer match
-/// (the variable drifted since the set formed). The peer hands the keyfile
-/// out only against the root password it can verify locally. None when no
-/// peer holds a set, none answers, or none accepts the credentials — the
-/// caller then derives from the environment, exactly the pre-pin behavior.
-pub async fn discover_live_set_keyfile(config: &Config) -> Option<String> {
+use crate::peers::KeyfileFetch;
+
+/// How many rounds a node with no pin keeps asking set-holding peers for the
+/// keyfile while none of them can judge the root password (mongod not
+/// answering behind the health server, or no member PRIMARY/SECONDARY yet),
+/// POLL_INTERVAL apart, before it stops and lets the next boot ask again.
+const KEYFILE_DISCOVERY_ROUNDS: u32 = 20;
+
+/// The verdict of one keyfile-discovery round over the peers that hold a set.
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyfileDiscovery {
+    /// A settled member handed the keyfile out against the root password.
+    Adopt { host: String, keyfile: String },
+    /// A settled member's mongod refused the root password: the environment
+    /// drifted from what the set enforces — a credential verdict, not a
+    /// keyfile problem to work around.
+    Refused { host: String },
+    /// Peers hold a set but none that could judge answered; ask again.
+    Retry,
+    /// No peer holds a set, or none that does can hand a keyfile out: derive
+    /// from RS_KEY (the bootstrap of a fresh set, a node booting before its
+    /// peers, or peers on an image without the route).
+    Derive,
+}
+
+/// Fold one round's answers: `(host, settled, fetch)` for every peer that
+/// reports a set, `settled` meaning its mongod is PRIMARY or SECONDARY. Only
+/// settled members give verdicts — a member mid-initial-sync verifies
+/// passwords against a copy of `admin` that the sync is about to replace.
+pub fn fold_keyfile_answers(answers: &[(String, bool, KeyfileFetch)]) -> KeyfileDiscovery {
+    if let Some((host, keyfile)) = answers
+        .iter()
+        .find_map(|(host, settled, fetch)| match fetch {
+            KeyfileFetch::Keyfile(k) if *settled => Some((host.clone(), k.clone())),
+            _ => None,
+        })
+    {
+        return KeyfileDiscovery::Adopt { host, keyfile };
+    }
+    if let Some(host) = answers.iter().find_map(|(host, settled, fetch)| {
+        (*settled && *fetch == KeyfileFetch::Refused).then(|| host.clone())
+    }) {
+        return KeyfileDiscovery::Refused { host };
+    }
+    let pending = answers.iter().any(|(_, settled, fetch)| match fetch {
+        KeyfileFetch::Unavailable => true,
+        KeyfileFetch::Unsupported => false,
+        KeyfileFetch::Keyfile(_) | KeyfileFetch::Refused => !*settled,
+    });
+    if pending {
+        KeyfileDiscovery::Retry
+    } else {
+        KeyfileDiscovery::Derive
+    }
+}
+
+/// The customer-facing reason a node stops when a settled member of the live
+/// set refuses its root password. Names the variables and the fix.
+pub fn drift_refusal_guidance(host: &str) -> String {
+    format!(
+        "the live replica set refused this node's MONGO_INITDB_ROOT_PASSWORD: member {host} answered 401 \
+         to /rs/keyfile after checking the password against its own mongod. The variable — and RS_KEY, \
+         which the template derives from it — was edited after the set formed; editing them on a running \
+         HA set is not supported, and a keyfile derived from the edited RS_KEY would be refused by every \
+         member, so this node stops here instead of joining with it. Fix: restore the previous value of \
+         MONGO_INITDB_ROOT_PASSWORD (RS_KEY follows it by reference) and redeploy this service."
+    )
+}
+
+/// Same verdict, reached later: the primary refused the credentials while
+/// this node was being added to the set (the keyfile came from RS_KEY because
+/// no peer held a set at boot, or the password alone drifted).
+pub fn join_refusal_guidance(primary_host: &str, pinned: bool, cause: &str) -> String {
+    let identity = if pinned {
+        "the root password pinned on this volume"
+    } else {
+        "this node's MONGO_INITDB_ROOT_PASSWORD"
+    };
+    format!(
+        "the set's primary at {primary_host} refused {identity} while this node was being added to the \
+         set ({cause}); it does not match the password the set enforces. Editing \
+         MONGO_INITDB_ROOT_PASSWORD (and RS_KEY, which the template derives from it) on a running HA set \
+         is not supported; this node stops instead of retrying forever. Fix: restore the previous value \
+         of MONGO_INITDB_ROOT_PASSWORD (RS_KEY follows it by reference) and redeploy this service."
+    )
+}
+
+fn keyfile_unobtainable_guidance(hosts: &[String], waited: Duration) -> String {
+    format!(
+        "peers {hosts:?} hold a live replica set but no PRIMARY/SECONDARY member could hand out its \
+         keyfile within {}s (mongod not answering behind them, or none settled yet); stopping so the \
+         next boot asks again — deriving the keyfile from RS_KEY beside a live set could give this node \
+         one the set refuses",
+        waited.as_secs()
+    )
+}
+
+/// Before mongod spawns on a node with no credential pin: if any peer already
+/// holds a set, this node must run with THAT set's keyfile — its own
+/// derivation from RS_KEY may no longer match (the variable drifted since the
+/// set formed). A settled member hands the keyfile out only against the root
+/// password it can verify locally.
+///
+/// `Ok(Some(keyfile))` — adopted from a settled member. `Ok(None)` — no peer
+/// holds a set, or none that does can hand one out: derive from RS_KEY,
+/// exactly the bootstrap behaviour. `Err` — a settled member REFUSED the root
+/// password, or the set's members could not judge it for the whole retry
+/// budget: the caller stops the node with the message, which names the
+/// variables and the fix. A keyfile is never derived from RS_KEY beside a
+/// live set that refuses the password: every member would refuse it, the
+/// join would loop forever, and the edited values would end up pinned on
+/// this volume.
+pub async fn discover_live_set_keyfile(config: &Config) -> Result<Option<String>> {
     let http = reqwest::Client::new();
     let peer_hosts = config.peer_hosts();
     if peer_hosts.is_empty() {
-        return None;
+        return Ok(None);
     }
     let timeout = Duration::from_millis(config.peer_query_timeout_ms);
-    let answers = query_peers(&http, config, &peer_hosts).await;
-    for (host, answer) in &answers {
-        if !matches!(
-            answer,
-            PeerAnswer::State(RsState {
+    let mut rounds = 0u32;
+    loop {
+        let answers = query_peers(&http, config, &peer_hosts).await;
+        let mut holders = Vec::new();
+        for (host, answer) in &answers {
+            let PeerAnswer::State(RsState {
                 set_active: true,
+                my_state,
                 ..
-            })
-        ) {
-            continue;
+            }) = answer
+            else {
+                continue;
+            };
+            let settled = my_state
+                .as_deref()
+                .is_some_and(|s| s == "PRIMARY" || s == "SECONDARY");
+            let fetch = fetch_keyfile(
+                &http,
+                host,
+                config.health_port,
+                timeout,
+                &config.mongo_root_username,
+                &config.mongo_root_password,
+            )
+            .await;
+            holders.push((host.clone(), settled, fetch));
         }
-        if let Some(keyfile) = fetch_keyfile(
-            &http,
-            host,
-            config.health_port,
-            timeout,
-            &config.mongo_root_username,
-            &config.mongo_root_password,
-        )
-        .await
-        {
-            info!(%host, "adopted the live set's keyfile from a peer");
-            return Some(keyfile);
+        match fold_keyfile_answers(&holders) {
+            KeyfileDiscovery::Adopt { host, keyfile } => {
+                info!(%host, "adopted the live set's keyfile from a peer");
+                return Ok(Some(keyfile));
+            }
+            KeyfileDiscovery::Refused { host } => {
+                return Err(anyhow::anyhow!(drift_refusal_guidance(&host)));
+            }
+            KeyfileDiscovery::Derive => {
+                if !holders.is_empty() {
+                    let peers: Vec<&str> = holders.iter().map(|(h, _, _)| h.as_str()).collect();
+                    warn!(?peers, "peers hold a set but none can hand out its keyfile (no /rs/keyfile route?); deriving from RS_KEY");
+                }
+                return Ok(None);
+            }
+            KeyfileDiscovery::Retry => {
+                rounds += 1;
+                if rounds >= KEYFILE_DISCOVERY_ROUNDS {
+                    let hosts: Vec<String> = holders.into_iter().map(|(h, _, _)| h).collect();
+                    return Err(anyhow::anyhow!(keyfile_unobtainable_guidance(
+                        &hosts,
+                        POLL_INTERVAL * KEYFILE_DISCOVERY_ROUNDS
+                    )));
+                }
+                if rounds == 1 {
+                    info!("peers hold a set but no settled member could judge the root password yet; asking again");
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
         }
-        warn!(%host, "peer holds a set but did not hand out its keyfile; falling back to RS_KEY");
     }
-    None
 }
 
 /// Add this node to the live set through its primary. `Ok(true)` when a
@@ -351,15 +494,14 @@ pub async fn discover_live_set_keyfile(config: &Config) -> Option<String> {
 /// primary will deliver it over heartbeats).
 async fn add_self_through_primary(
     config: &Config,
+    mongo: &Mongo,
     primary_host: &str,
     my_has_data: bool,
     telemetry: &Telemetry,
 ) -> Result<bool> {
-    let primary = Mongo::connect_member(
-        primary_host,
-        &config.mongo_root_username,
-        &config.mongo_root_password,
-    );
+    // The identity this node's own pool runs on (the pin's, when the volume
+    // carries one), not the environment's: the set shares one root user.
+    let primary = mongo.connect_member_as_self(primary_host).await;
     let current = primary
         .rs_config()
         .await
@@ -471,10 +613,34 @@ pub async fn orchestrate(
                 stable_since = None;
                 match primary_host {
                     Some(primary) => {
-                        match add_self_through_primary(&config, &primary, my_has_data, &telemetry)
-                            .await
+                        match add_self_through_primary(
+                            &config,
+                            &mongo,
+                            &primary,
+                            my_has_data,
+                            &telemetry,
+                        )
+                        .await
                         {
                             Ok(_) => last_log.clear(),
+                            Err(e) if crate::mongo::is_authentication_failure(&e) => {
+                                // A credential verdict from the set itself: no
+                                // retry changes it. Stop with the fix in the
+                                // log (see the module doc); the supervisor
+                                // shuts mongod down and exits non-zero.
+                                let pinned =
+                                    mongo.current_password().await != config.mongo_root_password;
+                                let error =
+                                    join_refusal_guidance(&primary, pinned, &format!("{e:#}"));
+                                error!("{error}");
+                                telemetry.send_once(TelemetryEvent::ComponentError {
+                                    component: "mongo-wrapper".to_string(),
+                                    error,
+                                    context: "join-refused".to_string(),
+                                });
+                                crate::process_manager::request_fail_stop();
+                                return;
+                            }
                             Err(e) => {
                                 let code = command_error_code(&e);
                                 if matches!(
@@ -880,5 +1046,71 @@ mod tests {
         assert!(wait_log_once(&mut last, "a"));
         assert!(!wait_log_once(&mut last, "a"));
         assert!(wait_log_once(&mut last, "b"));
+    }
+
+    #[test]
+    fn keyfile_discovery_takes_verdicts_from_settled_members_only() {
+        use KeyfileFetch::*;
+        let h = |host: &str, settled: bool, fetch: KeyfileFetch| (host.to_string(), settled, fetch);
+        // A settled member's keyfile wins, whatever the others said.
+        assert_eq!(
+            fold_keyfile_answers(&[h("a", true, Refused), h("b", true, Keyfile("K".into()))]),
+            KeyfileDiscovery::Adopt {
+                host: "b".into(),
+                keyfile: "K".into()
+            }
+        );
+        // A settled member's refusal is THE verdict; an unsettled member's
+        // keyfile does not outrank it.
+        assert_eq!(
+            fold_keyfile_answers(&[h("a", true, Refused), h("b", false, Keyfile("K".into()))]),
+            KeyfileDiscovery::Refused { host: "a".into() }
+        );
+        // Unsettled members (mid-initial-sync) and unavailable ones: ask again.
+        assert_eq!(
+            fold_keyfile_answers(&[h("a", false, Refused)]),
+            KeyfileDiscovery::Retry
+        );
+        assert_eq!(
+            fold_keyfile_answers(&[h("a", false, Keyfile("K".into()))]),
+            KeyfileDiscovery::Retry
+        );
+        assert_eq!(
+            fold_keyfile_answers(&[h("a", true, Unavailable)]),
+            KeyfileDiscovery::Retry
+        );
+        assert_eq!(
+            fold_keyfile_answers(&[h("a", true, Unsupported), h("b", true, Unavailable)]),
+            KeyfileDiscovery::Retry
+        );
+        // Nobody holds a set, or the holders cannot hand one out: derive.
+        assert_eq!(fold_keyfile_answers(&[]), KeyfileDiscovery::Derive);
+        assert_eq!(
+            fold_keyfile_answers(&[h("a", true, Unsupported), h("b", false, Unsupported)]),
+            KeyfileDiscovery::Derive
+        );
+    }
+
+    #[test]
+    fn refusal_guidance_names_the_variables_and_the_fix() {
+        let drift = drift_refusal_guidance("mongo-1");
+        for needle in [
+            "MONGO_INITDB_ROOT_PASSWORD",
+            "RS_KEY",
+            "mongo-1",
+            "401",
+            "restore the previous value",
+            "redeploy",
+        ] {
+            assert!(drift.contains(needle), "missing {needle:?}");
+        }
+        let pinned = join_refusal_guidance("mongo-1:27017", true, "AuthenticationFailed");
+        assert!(pinned.contains("pinned on this volume"));
+        assert!(pinned.contains("mongo-1:27017") && pinned.contains("AuthenticationFailed"));
+        assert!(pinned.contains("MONGO_INITDB_ROOT_PASSWORD") && pinned.contains("RS_KEY"));
+        assert!(pinned.contains("restore the previous value") && pinned.contains("redeploy"));
+        let env = join_refusal_guidance("mongo-1:27017", false, "x");
+        assert!(!env.contains("pinned on this volume"));
+        assert!(env.contains("this node's MONGO_INITDB_ROOT_PASSWORD"));
     }
 }

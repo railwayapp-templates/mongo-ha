@@ -101,7 +101,23 @@ async fn main() -> Result<()> {
     }
     let live_set_keyfile =
         if config.rs_enabled() && pin.as_ref().is_none_or(|p| p.keyfile.is_none()) {
-            rs::discover_live_set_keyfile(&config).await
+            match rs::discover_live_set_keyfile(&config).await {
+                Ok(keyfile) => keyfile,
+                Err(e) => {
+                    // Fail-stop BEFORE mongod spawns: the volume is left as
+                    // it is, nothing is pinned, the log carries the fix, and
+                    // the restart policy retries the boot — which succeeds
+                    // once the variables are restored (see rs.rs).
+                    let error = format!("{e:#}");
+                    tracing::error!("{error}");
+                    telemetry.send_once(TelemetryEvent::ComponentError {
+                        component: "mongo-wrapper".to_string(),
+                        error,
+                        context: "join-refused".to_string(),
+                    });
+                    std::process::exit(process_manager::FAIL_STOP_EXIT_CODE);
+                }
+            }
         } else {
             None
         };
@@ -203,6 +219,7 @@ async fn main() -> Result<()> {
         creds.clone(),
         mongo.clone(),
         telemetry.clone(),
+        config.rs_enabled(),
     ));
 
     // MONGO_INITDB_ROOT_USERNAME/PASSWORD reach docker-entrypoint.sh through
