@@ -120,7 +120,18 @@ The `mongo-wrapper` binary (one per data node):
   properly rotated stored user (`db.changeUserPassword`, then the variable)
   is adopted live. A node with no pin that finds a live set adopts that set's
   keyfile from a peer over `POST /rs/keyfile`, which hands it out only
-  against a root password the peer verifies on its own mongod.
+  against a root password the peer verifies on its own mongod. A settled
+  member (PRIMARY/SECONDARY) refusing that password is the verdict that the
+  variables drifted: the node stops before mongod spawns, exit code 78, with
+  the fix in its log (restore `MONGO_INITDB_ROOT_PASSWORD` — `RS_KEY` follows
+  it by reference — and redeploy), instead of deriving a keyfile from the
+  edited `RS_KEY` and looping on a join the set refuses; it derives from
+  `RS_KEY` only when no peer holds a set. The same stop applies when the
+  primary refuses the credentials while adding the node. The pin is written
+  only once the node is a PRIMARY or SECONDARY of the set — a joiner's local
+  root user is replaced by initial sync, so a proof against it proves nothing
+  — and peers (switchover, self-add) are reached with the password the pool
+  runs on, not the environment's.
 - **Standalone mode.** Without `RS_SEEDS` (or with `RS_ENABLED=false`, which
   the revert flow sets) mongod runs with no `--replSet`, exactly as the
   upstream image would. A replica set config left in the `local` database by

@@ -766,6 +766,20 @@ t_password_variable_edit_does_not_rotate() {
   done
   ok "every member rejoined after the environment edit (pinned keyfile still shared)"
 
+  # The switchover reaches the other members with the credentials the wrapper
+  # runs on (the pin's), not the edited variable: the freeze and the step-down
+  # on the peers must authenticate, and the target must win.
+  local sw_primary sw_target sw_code
+  # The old primary was the last node rolled: give the set its election.
+  wait_until 60 "a primary after the roll" any_role_200 mongo-2 mongo-1 mongo-2 mongo-3 || { bad "no primary after the roll"; return; }
+  sw_primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" || { bad "no primary after the roll"; return; }
+  sw_target="$(printf 'mongo-1\nmongo-2\nmongo-3\n' | grep -v "^$sw_primary$" | tail -1)"
+  sw_code="$(switchover_code mongo-2 "$sw_target")"
+  [ "$sw_code" = "200" ] && ok "POST /switchover on $sw_target answered 200 after the edit (peer credentials from the pin)" \
+    || bad "POST /switchover on $sw_target answered $sw_code after the edit"
+  wait_until 60 "$sw_target is the primary after the post-edit switchover" bash -c "[ \"\$(docker exec mongo-2 wget -q -O /dev/null http://$sw_target:8080/role 2>/dev/null && echo 200 || echo 503)\" = 200 ]" \
+    && ok "switchover target became primary after the edit" || bad "switchover target did not become primary after the edit"
+
   # The OLD password is the one mongod enforces — and the one the wrapper uses.
   local v
   v="$(mongo mongo-1 'db.getSiblingDB("t").kv.findOne({_id: 20}).v')"
@@ -837,6 +851,86 @@ t_missing_rs_key_refuses_boot() {
   docker rm -f mongo-nokey >/dev/null
 }
 
+# start_joiner_once <n> [extra docker args...] — a scale-up joiner (seeds carry
+# the trio plus itself) WITHOUT a restart policy: the scenario below wants to
+# see the container's own exit and code, not docker restarting it.
+start_joiner_once() {
+  local n="$1"; shift
+  docker volume create --label "$LABEL" "mongo-ha-e2e-vol-$n" >/dev/null
+  docker run -d --label "$LABEL" --restart no \
+    --name "mongo-$n" --hostname "mongo-$n" \
+    --network "$NET" --network-alias "mongo-$n" \
+    -v "mongo-ha-e2e-vol-$n:/data/db" \
+    -e MONGO_INITDB_ROOT_USERNAME="$ROOT_USER" \
+    -e MONGO_INITDB_ROOT_PASSWORD="$ROOT_PW" \
+    -e RS_KEY="$RS_KEY" \
+    -e RS_NAME="$RS_NAME" \
+    -e RS_SEEDS="$SEEDS,mongo-$n:27017" \
+    -e RAILWAY_PRIVATE_DOMAIN="mongo-$n" \
+    -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
+    -e RAILWAY_VOLUME_MOUNT_PATH="/data/db" \
+    -e BOOTSTRAP_DWELL_SECONDS=5 \
+    "$@" \
+    "$IMAGE" >/dev/null
+}
+
+# volume_has <volume> <path> — whether a file exists on a labeled volume, read
+# from a throwaway container (the owning container may already be gone).
+volume_has() {
+  docker run --rm --entrypoint sh -v "$1:/v:ro" "$IMAGE" -c "test -e /v/$2" >/dev/null 2>&1
+}
+
+t_drifted_joiner_fails_stop_with_guidance() {
+  log "t_drifted_joiner_fails_stop_with_guidance (fresh trio)"
+  teardown_trio
+  start_trio
+  wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }
+
+  # The template stamps RS_KEY=${{MONGO_INITDB_ROOT_PASSWORD}}: an edit of the
+  # password moves BOTH. A fresh joiner deployed after such an edit carries
+  # credentials the live set refuses. It must stop with the fix in its log,
+  # pin nothing and leave the set alone — not derive a keyfile the set refuses,
+  # loop on the join, and pin the edited values.
+  start_joiner_once 4 -e MONGO_INITDB_ROOT_PASSWORD="edited-pw" -e RS_KEY="edited-pw"
+  wait_until 120 "drifted joiner exits" bash -c '[ "$(docker inspect -f "{{.State.Running}}" mongo-4 2>/dev/null)" = false ]' \
+    && ok "drifted joiner stopped instead of looping" || bad "drifted joiner kept running"
+  local code
+  code="$(docker inspect -f '{{.State.ExitCode}}' mongo-4 2>/dev/null)"
+  [ "$code" = "78" ] && ok "drifted joiner exited with the fail-stop code ($code)" || bad "drifted joiner exit code '$code' (want 78)"
+  if docker logs mongo-4 2>&1 | grep -F "refused this node's MONGO_INITDB_ROOT_PASSWORD" | grep -F "RS_KEY" | grep -qF "restore the previous value"; then
+    ok "fail-stop names MONGO_INITDB_ROOT_PASSWORD, RS_KEY and the fix"
+  else
+    bad "fail-stop guidance missing from the joiner's log"
+  fi
+  if node_logged mongo-4 "falling back to RS_KEY" || node_logged mongo-4 "join attempt failed" || node_logged mongo-4 "starting docker-entrypoint.sh mongod"; then
+    bad "drifted joiner derived a keyfile from the edited RS_KEY, spawned mongod or tried to join"
+  else
+    ok "stopped before mongod spawned: no RS_KEY fallback, no join attempt"
+  fi
+  if volume_has mongo-ha-e2e-vol-4 .railway-mongo-auth-pin; then
+    bad "drifted joiner pinned the edited credentials"
+  else
+    ok "no credential pin written on the drifted joiner's volume"
+  fi
+  [ "$(mongo mongo-1 'rs.conf().members.length' | tr -d '[:space:]')" = "3" ] \
+    && ok "existing members untouched (still 3 in the config)" || bad "the drifted joiner changed the set's config"
+  set_is_fully_online mongo-1 && ok "trio still fully online" || bad "trio degraded by the drifted joiner"
+
+  # The fix the guidance names: restore the variables and redeploy the same
+  # service (same volume). The joiner now adopts the set's keyfile and joins.
+  docker rm -f mongo-4 >/dev/null 2>&1
+  SEEDS_OVERRIDE="$SEEDS,mongo-4:27017" start_node 4
+  wait_until 300 "4 healthy members" has_n_healthy mongo-1 4 \
+    && ok "joiner succeeded once the variables were restored" || bad "joiner did not join after the variables were restored"
+  node_logged mongo-4 "adopted the live set's keyfile from a peer" \
+    && ok "restored joiner adopted the live set's keyfile" || bad "restored joiner did not adopt the live keyfile"
+  wait_until 90 "restored joiner pins after membership" bash -c 'docker exec mongo-4 test -s /data/db/.railway-mongo-auth-pin' \
+    && ok "restored joiner pinned its credentials once a member" || bad "restored joiner never pinned"
+
+  docker rm -f mongo-4 >/dev/null 2>&1; docker volume rm mongo-ha-e2e-vol-4 >/dev/null 2>&1
+  teardown_trio
+}
+
 ALL_TESTS=(
   t_set_forms_and_replicates
   t_failover_on_primary_pause
@@ -853,6 +947,7 @@ ALL_TESTS=(
   t_password_variable_edit_does_not_rotate
   t_fresh_member_adopts_live_keyfile
   t_missing_rs_key_refuses_boot
+  t_drifted_joiner_fails_stop_with_guidance
 )
 
 main() {

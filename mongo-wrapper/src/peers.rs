@@ -93,9 +93,38 @@ struct KeyfileRequest<'a> {
     password: &'a str,
 }
 
+/// What a peer's `/rs/keyfile` said. Only `Refused` is a credential verdict:
+/// the peer's own mongod judged the root password wrong. Everything else is
+/// "cannot tell" or "cannot help", never evidence about the password.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyfileFetch {
+    /// The set's keyfile, handed out against the root password.
+    Keyfile(String),
+    /// 401: the peer's mongod refused the root password.
+    Refused,
+    /// 503 or a transport failure: the peer cannot judge right now.
+    Unavailable,
+    /// Any other answer — a 404 from an image without the route, an empty
+    /// body: this peer cannot hand a keyfile out at all.
+    Unsupported,
+}
+
+/// Map an HTTP reply from `/rs/keyfile` to a fetch outcome.
+pub fn classify_keyfile_reply(status: u16, body: Option<&str>) -> KeyfileFetch {
+    match status {
+        200..=299 => match body.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(keyfile) => KeyfileFetch::Keyfile(keyfile.to_string()),
+            None => KeyfileFetch::Unsupported,
+        },
+        401 => KeyfileFetch::Refused,
+        503 => KeyfileFetch::Unavailable,
+        _ => KeyfileFetch::Unsupported,
+    }
+}
+
 /// Ask a peer for the keyfile its set runs with, proving the root password
 /// (the peer verifies it against its own mongod before answering — see
-/// health_server::rs_keyfile). None on any refusal or transport failure.
+/// health_server::rs_keyfile).
 pub async fn fetch_keyfile(
     client: &reqwest::Client,
     host: &str,
@@ -103,7 +132,7 @@ pub async fn fetch_keyfile(
     timeout: Duration,
     username: &str,
     password: &str,
-) -> Option<String> {
+) -> KeyfileFetch {
     let url = format!("http://{host}:{health_port}/rs/keyfile");
     match client
         .post(&url)
@@ -112,19 +141,47 @@ pub async fn fetch_keyfile(
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => resp
-            .text()
-            .await
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
         Ok(resp) => {
-            debug!(host, status = %resp.status(), "peer /rs/keyfile refused");
-            None
+            let status = resp.status();
+            let body = resp.text().await.ok();
+            let fetch = classify_keyfile_reply(status.as_u16(), body.as_deref());
+            if !matches!(fetch, KeyfileFetch::Keyfile(_)) {
+                debug!(host, %status, ?fetch, "peer /rs/keyfile did not hand out the keyfile");
+            }
+            fetch
         }
         Err(e) => {
             debug!(host, error = %format!("{e:#}"), "peer /rs/keyfile unreachable");
-            None
+            KeyfileFetch::Unavailable
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyfile_replies_classify_by_status_and_body() {
+        assert_eq!(
+            classify_keyfile_reply(200, Some(" KEY== \n")),
+            KeyfileFetch::Keyfile("KEY==".into())
+        );
+        assert_eq!(
+            classify_keyfile_reply(200, Some("  ")),
+            KeyfileFetch::Unsupported
+        );
+        assert_eq!(classify_keyfile_reply(200, None), KeyfileFetch::Unsupported);
+        assert_eq!(
+            classify_keyfile_reply(401, Some("authentication failed")),
+            KeyfileFetch::Refused
+        );
+        assert_eq!(
+            classify_keyfile_reply(503, Some("mongod not ready")),
+            KeyfileFetch::Unavailable
+        );
+        // A standalone node or an image without the route: not a verdict.
+        assert_eq!(classify_keyfile_reply(404, None), KeyfileFetch::Unsupported);
+        assert_eq!(classify_keyfile_reply(405, None), KeyfileFetch::Unsupported);
     }
 }

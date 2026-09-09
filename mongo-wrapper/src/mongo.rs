@@ -56,6 +56,22 @@ impl Hello {
     pub fn replication_enabled(&self) -> bool {
         self.set_name.is_some() || self.isreplicaset
     }
+
+    /// This node is a settled member of its set: PRIMARY or SECONDARY, past
+    /// initial sync. A member in STARTUP2/RECOVERING/REMOVED is not.
+    pub fn is_settled_member(&self) -> bool {
+        self.set_name.is_some() && (self.is_writable_primary || self.secondary)
+    }
+
+    fn from_document(d: &Document) -> Self {
+        Hello {
+            is_writable_primary: d.get_bool("isWritablePrimary").unwrap_or(false),
+            secondary: d.get_bool("secondary").unwrap_or(false),
+            set_name: d.get_str("setName").ok().map(str::to_string),
+            isreplicaset: d.get_bool("isreplicaset").unwrap_or(false),
+            primary: d.get_str("primary").ok().map(str::to_string),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,6 +173,19 @@ pub fn command_error_code(e: &anyhow::Error) -> Option<i32> {
         })
 }
 
+/// The server refused the credentials this connection presented — the
+/// driver's own authentication failure, or the server's code 18
+/// (AuthenticationFailed) surfacing as a command error. A credential verdict,
+/// as opposed to a node that is down, busy or not a primary.
+pub fn is_authentication_failure(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<mongodb::error::Error>()
+        .is_some_and(|e| match e.kind.as_ref() {
+            ErrorKind::Authentication { .. } => true,
+            ErrorKind::Command(c) => c.code == 18,
+            _ => false,
+        })
+}
+
 fn client_for(host: &str, port: u16, username: &str, password: &str, direct: bool) -> Client {
     let credential = Credential::builder()
         .username(username.to_string())
@@ -187,6 +216,36 @@ fn client_for(host: &str, port: u16, username: &str, password: &str, direct: boo
     // `with_options` only fails on structurally invalid options; ours are
     // built above, so a failure here is a programming error.
     Client::with_options(options).expect("static client options are valid")
+}
+
+/// Like `probe_password`, on a throwaway connection, but the probing command
+/// is `hello`, so a `Works` also says WHAT answered: whether this node is a
+/// settled member of a set (see Hello::is_settled_member). The credential
+/// resolver needs both facts from the same connection — a password proven
+/// against a joiner's mongod mid-initial-sync proves nothing about the set.
+pub async fn probe_password_hello(
+    host: &str,
+    port: u16,
+    username: &str,
+    password: &str,
+) -> (PasswordProbe, Option<Hello>) {
+    let client = client_for(host, port, username, password, true);
+    let attempt = tokio::time::timeout(
+        PASSWORD_PROBE_TIMEOUT,
+        client.database("admin").run_command(doc! { "hello": 1 }),
+    )
+    .await;
+    let outcome = match attempt {
+        Ok(Ok(d)) => (PasswordProbe::Works, Some(Hello::from_document(&d))),
+        Ok(Err(e)) => match e.kind.as_ref() {
+            ErrorKind::Authentication { .. } => (PasswordProbe::AccessDenied, None),
+            ErrorKind::Command(c) if c.code == 18 => (PasswordProbe::AccessDenied, None),
+            _ => (PasswordProbe::NotReady(e.to_string()), None),
+        },
+        Err(_) => (PasswordProbe::NotReady("probe timed out".to_string()), None),
+    };
+    client.shutdown().await;
+    outcome
 }
 
 /// Parse a `host:port` member address; the port defaults to 27017 when
@@ -230,11 +289,6 @@ impl Mongo {
         old.shutdown().await;
     }
 
-    /// Probe this handle's own server with a candidate password.
-    pub async fn probe_local_password(&self, password: &str) -> PasswordProbe {
-        probe_password(&self.host, self.port, &self.username, password).await
-    }
-
     /// A direct connection to another member, for the operations that must
     /// run ON the primary (adding ourselves, a step-down, a freeze).
     pub fn connect_member(addr: &str, username: &str, password: &str) -> Self {
@@ -248,6 +302,30 @@ impl Mongo {
             username: username.to_string(),
             password: Arc::new(RwLock::new(password.to_string())),
         }
+    }
+
+    /// A direct connection to another member with the identity THIS handle
+    /// runs on — the pinned password when the volume carries one, the
+    /// environment's otherwise (see auth_pin.rs). The set shares one root
+    /// user, so the password that works here is the one that works there;
+    /// the environment's value may have been edited since.
+    pub async fn connect_member_as_self(&self, addr: &str) -> Self {
+        let password = self.password.read().await.clone();
+        Self::connect_member(addr, &self.username, &password)
+    }
+
+    /// The password the pooled client currently authenticates with.
+    pub async fn current_password(&self) -> String {
+        self.password.read().await.clone()
+    }
+
+    /// Probe this handle's own server with a candidate password and learn
+    /// what answered (see probe_password_hello).
+    pub async fn probe_local_password_hello(
+        &self,
+        password: &str,
+    ) -> (PasswordProbe, Option<Hello>) {
+        probe_password_hello(&self.host, self.port, &self.username, password).await
     }
 
     async fn admin(&self, command: Document, timeout: Duration) -> Result<Document> {
@@ -691,5 +769,55 @@ mod tests {
         assert!(initiated.replication_enabled());
         assert!(uninitiated.replication_enabled());
         assert!(!standalone.replication_enabled());
+    }
+
+    #[test]
+    fn a_settled_member_is_a_primary_or_secondary_of_a_named_set() {
+        let primary = Hello::from_document(&doc! {
+            "isWritablePrimary": true, "secondary": false, "setName": "rs0",
+        });
+        let secondary = Hello::from_document(&doc! {
+            "isWritablePrimary": false, "secondary": true, "setName": "rs0", "primary": "a:27017",
+        });
+        // STARTUP2 / RECOVERING: named set, neither role.
+        let syncing = Hello::from_document(&doc! {
+            "isWritablePrimary": false, "secondary": false, "setName": "rs0",
+        });
+        // --replSet with no config yet.
+        let uninitiated = Hello::from_document(&doc! {
+            "isWritablePrimary": false, "secondary": false, "isreplicaset": true,
+        });
+        let standalone = Hello::from_document(&doc! { "isWritablePrimary": true });
+        assert!(primary.is_settled_member());
+        assert!(secondary.is_settled_member());
+        assert_eq!(secondary.primary.as_deref(), Some("a:27017"));
+        assert!(!syncing.is_settled_member());
+        assert!(!uninitiated.is_settled_member());
+        assert!(!standalone.is_settled_member());
+    }
+
+    #[test]
+    fn authentication_failures_are_told_apart_from_other_errors() {
+        // The server's own verdict as a command error (code 18); the driver's
+        // `ErrorKind::Authentication` variant is non-exhaustive and cannot be
+        // built here, its arm is the same match `probe_password` relies on.
+        let code18: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
+            "code": 18, "codeName": "AuthenticationFailed", "errmsg": "Authentication failed.",
+        })
+        .unwrap();
+        let refused = anyhow::Error::new(mongodb::error::Error::from(ErrorKind::Command(code18)))
+            .context("replSetGetConfig failed")
+            .context("reading the set's config from mongo-1:27017");
+        assert!(is_authentication_failure(&refused));
+        let busy: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
+            "code": 109, "codeName": "ConfigurationInProgress", "errmsg": "x",
+        })
+        .unwrap();
+        assert!(!is_authentication_failure(&anyhow::Error::new(
+            mongodb::error::Error::from(ErrorKind::Command(busy))
+        )));
+        assert!(!is_authentication_failure(&anyhow!(
+            "hello timed out after 2s"
+        )));
     }
 }
