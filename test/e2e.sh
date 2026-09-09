@@ -685,9 +685,11 @@ revert_and_reconvert() {
     || { bad "pre-revert write was not acknowledged"; return 1; }
   case "$mode" in
     crash)
+      # Kill, then remove at once: the container's restart policy must not
+      # get a chance to boot mongod again before the volume is reused.
       docker kill mongo-1 >/dev/null
+      docker rm -f mongo-1 >/dev/null 2>&1
       log "root SIGKILLed right after the acknowledged write (no shutdown checkpoint)"
-      docker rm -f mongo-2 mongo-3 >/dev/null
       ;;
     clean)
       docker rm -f mongo-2 mongo-3 >/dev/null
@@ -695,8 +697,8 @@ revert_and_reconvert() {
       log "replicas deleted; root stopped with SIGTERM (shutdown checkpoint taken)"
       ;;
   esac
+  docker rm -f mongo-1 mongo-2 mongo-3 >/dev/null 2>&1
   docker volume rm mongo-ha-e2e-vol-2 mongo-ha-e2e-vol-3 >/dev/null 2>&1
-  docker rm -f mongo-1 >/dev/null
   docker run -d --label "$LABEL" --restart unless-stopped \
     --name mongo-1 --hostname mongo-1 --network "$NET" --network-alias mongo-1 \
     -v "mongo-ha-e2e-vol-1:/data/db" \
