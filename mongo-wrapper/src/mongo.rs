@@ -148,6 +148,70 @@ pub async fn probe_password(
     outcome
 }
 
+/// Outcome of proving that a caller IS the root account: authenticated as
+/// `username` on `admin` AND holding the `root` role there. What the keyfile
+/// exchange demands (see health_server::rs_keyfile): the keyfile is the
+/// `__system` credential, above every role, so a password that merely
+/// authenticates some `admin` user is not enough to be handed it.
+#[derive(Debug)]
+pub enum RootProbe {
+    Root,
+    /// Wrong password, or an account without the `root` role on `admin`.
+    Refused,
+    NotReady(String),
+}
+
+/// One throwaway connection running `connectionStatus`: the handshake proves
+/// the password, the reply names the account and roles the server actually
+/// granted the session. Same "not ready is not a verdict" rule as
+/// probe_password.
+pub async fn probe_root(host: &str, port: u16, username: &str, password: &str) -> RootProbe {
+    let client = client_for(host, port, username, password, true);
+    let attempt = tokio::time::timeout(
+        PASSWORD_PROBE_TIMEOUT,
+        client
+            .database("admin")
+            .run_command(doc! { "connectionStatus": 1 }),
+    )
+    .await;
+    let outcome = match attempt {
+        Ok(Ok(reply)) if authenticated_as_root(&reply, username) => RootProbe::Root,
+        Ok(Ok(_)) => RootProbe::Refused,
+        Ok(Err(e)) => match e.kind.as_ref() {
+            ErrorKind::Authentication { .. } => RootProbe::Refused,
+            // 18 = AuthenticationFailed, the server's own verdict.
+            ErrorKind::Command(c) if c.code == 18 => RootProbe::Refused,
+            _ => RootProbe::NotReady(e.to_string()),
+        },
+        Err(_) => RootProbe::NotReady("probe timed out".to_string()),
+    };
+    client.shutdown().await;
+    outcome
+}
+
+/// Whether a `connectionStatus` reply says the session is authenticated as
+/// `username` on `admin` and holds `root` on `admin`. Both lists are read:
+/// the caller named the root account, and the server must confirm that this
+/// is the account it authenticated and that the account still carries the
+/// role (a root user stripped of `root` is not root).
+pub fn authenticated_as_root(reply: &Document, username: &str) -> bool {
+    let Ok(info) = reply.get_document("authInfo") else {
+        return false;
+    };
+    let has_admin_entry = |list: &str, field: &str, value: &str| {
+        info.get_array(list)
+            .map(|entries| {
+                entries.iter().filter_map(Bson::as_document).any(|d| {
+                    d.get_str(field).is_ok_and(|v| v == value)
+                        && d.get_str("db").is_ok_and(|db| db == "admin")
+                })
+            })
+            .unwrap_or(false)
+    };
+    has_admin_entry("authenticatedUsers", "user", username)
+        && has_admin_entry("authenticatedUserRoles", "role", "root")
+}
+
 /// The error code of a server-side command failure, if that is what `e` is.
 pub fn command_error_code(e: &anyhow::Error) -> Option<i32> {
     e.downcast_ref::<mongodb::error::Error>()
@@ -675,6 +739,79 @@ mod tests {
             split_host_port("[fd12::1]:27017"),
             ("fd12::1".into(), 27017)
         );
+    }
+
+    /// The `connectionStatus` reply, as mongod shapes it.
+    fn connection_status(users: Vec<(&str, &str)>, roles: Vec<(&str, &str)>) -> Document {
+        let users: Vec<Bson> = users
+            .into_iter()
+            .map(|(user, db)| Bson::Document(doc! { "user": user, "db": db }))
+            .collect();
+        let roles: Vec<Bson> = roles
+            .into_iter()
+            .map(|(role, db)| Bson::Document(doc! { "role": role, "db": db }))
+            .collect();
+        doc! {
+            "authInfo": { "authenticatedUsers": users, "authenticatedUserRoles": roles },
+            "ok": 1,
+        }
+    }
+
+    #[test]
+    fn root_means_the_named_user_authenticated_on_admin_with_the_root_role() {
+        let reply = connection_status(vec![("mongo", "admin")], vec![("root", "admin")]);
+        assert!(authenticated_as_root(&reply, "mongo"));
+        // Extra roles beside root change nothing.
+        let reply = connection_status(
+            vec![("mongo", "admin")],
+            vec![("readWriteAnyDatabase", "admin"), ("root", "admin")],
+        );
+        assert!(authenticated_as_root(&reply, "mongo"));
+    }
+
+    #[test]
+    fn an_admin_user_without_the_root_role_is_not_root() {
+        let reply = connection_status(
+            vec![("reader", "admin")],
+            vec![("readAnyDatabase", "admin")],
+        );
+        assert!(!authenticated_as_root(&reply, "reader"));
+        // Even a rich set of roles is not `root`.
+        let reply = connection_status(
+            vec![("ops", "admin")],
+            vec![
+                ("userAdminAnyDatabase", "admin"),
+                ("dbAdminAnyDatabase", "admin"),
+                ("clusterAdmin", "admin"),
+            ],
+        );
+        assert!(!authenticated_as_root(&reply, "ops"));
+    }
+
+    #[test]
+    fn the_authenticated_account_must_be_the_one_named() {
+        // Some other account holding root does not make THIS request root.
+        let reply = connection_status(vec![("other", "admin")], vec![("root", "admin")]);
+        assert!(!authenticated_as_root(&reply, "mongo"));
+        // A `root`-named role on a different database is a different role.
+        let reply = connection_status(vec![("mongo", "admin")], vec![("root", "app")]);
+        assert!(!authenticated_as_root(&reply, "mongo"));
+        // Same username on a different authentication database.
+        let reply = connection_status(vec![("mongo", "app")], vec![("root", "admin")]);
+        assert!(!authenticated_as_root(&reply, "mongo"));
+    }
+
+    #[test]
+    fn an_unauthenticated_or_malformed_reply_is_not_root() {
+        assert!(!authenticated_as_root(
+            &connection_status(vec![], vec![]),
+            "mongo"
+        ));
+        assert!(!authenticated_as_root(&doc! { "ok": 1 }, "mongo"));
+        assert!(!authenticated_as_root(
+            &doc! { "authInfo": { "authenticatedUsers": "mongo" } },
+            "mongo"
+        ));
     }
 
     #[test]

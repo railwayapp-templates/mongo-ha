@@ -13,8 +13,10 @@
 //!                 node holds a set, who its primary is, whether it holds user
 //!                 data. 503 until the FINAL mongod answers, so a peer
 //!                 mid-boot reads as "not ready", never as "empty and free".
-//!   POST /rs/keyfile — hand the set's keyfile to a node that proves the root
-//!                 password (verified against this node's own mongod). How a
+//!   POST /rs/keyfile — hand the set's keyfile to the ROOT account: the caller
+//!                 sends the root username and password, this node
+//!                 authenticates them against its own mongod and confirms the
+//!                 session holds the `root` role (`connectionStatus`). How a
 //!                 fresh member joins after the environment's RS_KEY drifted
 //!                 from what the set runs with (see auth_pin.rs).
 //!   POST /switchover — ask THIS node to become the primary (the generic
@@ -24,7 +26,7 @@
 //!                 election; 200 means it did (which /role then reflects).
 
 use crate::config::Config;
-use crate::mongo::{has_majority, probe_password, Mongo, PasswordProbe, RsStatus};
+use crate::mongo::{has_majority, probe_root, Mongo, RootProbe, RsStatus};
 use crate::rs::local_rs_state;
 use anyhow::Context;
 use axum::{
@@ -38,6 +40,8 @@ use common::{Telemetry, TelemetryEvent};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
 pub struct AppState {
@@ -56,9 +60,22 @@ struct KeyfileRequest {
     password: String,
 }
 
-/// The set's keyfile, to a caller that proves the root password against this
-/// node's own mongod. 401 on a wrong password, 503 while mongod cannot judge,
-/// 404 on a standalone node (there is no set to join).
+/// At most this many /rs/keyfile credential checks run at once, and every
+/// refusal keeps its slot for KEYFILE_REFUSAL_DELAY before answering. The
+/// exchange answers with the `__system` credential, so guessing at it through
+/// this route must cost at least what guessing at mongod's own port does. A
+/// caller with the right credential never waits on the delay, and the cap is
+/// far above the handful of members a set boots at once.
+static KEYFILE_PROBES: Semaphore = Semaphore::const_new(4);
+const KEYFILE_REFUSAL_DELAY: Duration = Duration::from_secs(1);
+
+/// The set's keyfile, to the root account only: the request must name the
+/// configured root username, the password must authenticate against this
+/// node's own mongod, and the authenticated session must hold `root` on
+/// `admin`. 401 otherwise, 503 while mongod cannot judge, 404 on a standalone
+/// node (there is no set to join). The probe runs against the local mongod, so
+/// it follows the password the set actually enforces (the pin's), never the
+/// environment variable.
 async fn rs_keyfile(
     State(state): State<Arc<AppState>>,
     Json(req): Json<KeyfileRequest>,
@@ -69,25 +86,52 @@ async fn rs_keyfile(
             "not a replica set member".to_string(),
         );
     };
-    match probe_password(
-        "127.0.0.1",
-        state.config.mongo_port,
-        &req.username,
-        &req.password,
-    )
-    .await
-    {
-        PasswordProbe::Works => (StatusCode::OK, keyfile.to_string()),
-        PasswordProbe::AccessDenied => {
-            warn!("refused a /rs/keyfile request: authentication failed");
-            (
-                StatusCode::UNAUTHORIZED,
-                "authentication failed".to_string(),
-            )
+    // Nothing closes the semaphore; a closed one is treated like "cannot
+    // judge" rather than a panic inside a request handler.
+    let Ok(_slot) = KEYFILE_PROBES.acquire().await else {
+        return keyfile_reply(keyfile, &RootProbe::NotReady("probe slots closed".into()));
+    };
+    // Any other account is refused before mongod is even asked: the exchange
+    // is for the root account, and a valid password for some other user must
+    // not be probed on its behalf.
+    let probe = if req.username == state.config.mongo_root_username {
+        probe_root(
+            "127.0.0.1",
+            state.config.mongo_port,
+            &req.username,
+            &req.password,
+        )
+        .await
+    } else {
+        RootProbe::Refused
+    };
+    match &probe {
+        RootProbe::Root => {}
+        RootProbe::Refused => {
+            warn!("refused a /rs/keyfile request: not the root account");
+            tokio::time::sleep(KEYFILE_REFUSAL_DELAY).await;
         }
-        PasswordProbe::NotReady(e) => (
+        RootProbe::NotReady(e) => {
+            warn!(error = %e, "/rs/keyfile: mongod could not judge the credential")
+        }
+    }
+    keyfile_reply(keyfile, &probe)
+}
+
+/// What /rs/keyfile answers for a probe outcome. The bodies are fixed strings:
+/// a refusal does not say which of username, password or role failed, and the
+/// 503 keeps the driver's error text for the log (see rs_keyfile) rather than
+/// relaying it to a remote caller.
+fn keyfile_reply(keyfile: &str, probe: &RootProbe) -> (StatusCode, String) {
+    match probe {
+        RootProbe::Root => (StatusCode::OK, keyfile.to_string()),
+        RootProbe::Refused => (
+            StatusCode::UNAUTHORIZED,
+            "authentication failed".to_string(),
+        ),
+        RootProbe::NotReady(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("mongod not ready: {e}"),
+            "mongod not ready".to_string(),
         ),
     }
 }
@@ -365,5 +409,118 @@ pub async fn run_health_server_supervised(
         }
 
         tokio::time::sleep(RESPAWN_DELAY).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    fn config(mongo_port: u16) -> Config {
+        Config {
+            mongo_root_username: "mongo".into(),
+            mongo_root_password: "pw".into(),
+            mongo_port,
+            rs_enabled_flag: true,
+            rs_seeds: Some("mongo-1:27017,mongo-2:27017,mongo-3:27017".into()),
+            rs_name: "rs0".into(),
+            rs_key: Some("k".into()),
+            keyfile_path: "/run/mongo-ha/keyfile".into(),
+            health_port: 8080,
+            private_domain: "mongo-1".into(),
+            data_dir: "/data/db".into(),
+            peer_query_timeout_ms: 2000,
+            bootstrap_dwell_seconds: 15,
+            demote_timeout_ms: 20_000,
+            peer_gone_dwell_seconds: 1800,
+        }
+    }
+
+    /// A loopback port nothing listens on: bound, read, released.
+    async fn closed_port() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// The keyfile route alone, served on a loopback port for the test's life.
+    async fn serve(state: Arc<AppState>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/rs/keyfile", post(rs_keyfile))
+            .with_state(state);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}/rs/keyfile")
+    }
+
+    fn member_state(mongo_port: u16, keyfile: Option<&str>) -> Arc<AppState> {
+        Arc::new(AppState {
+            mongo: Mongo::connect_local(mongo_port, "mongo", "pw"),
+            config: Arc::new(config(mongo_port)),
+            standalone: keyfile.is_none(),
+            keyfile: keyfile.map(|k| Arc::new(k.to_string())),
+            has_data: false,
+        })
+    }
+
+    #[test]
+    fn keyfile_reply_hands_the_keyfile_only_to_root() {
+        let (status, body) = keyfile_reply("KEY==", &RootProbe::Root);
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "KEY==");
+
+        let (status, body) = keyfile_reply("KEY==", &RootProbe::Refused);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, "authentication failed");
+    }
+
+    #[test]
+    fn keyfile_reply_keeps_driver_errors_out_of_the_body() {
+        let driver_text = "Kind: I/O error: Connection refused (os error 111), labels: {}";
+        let (status, body) = keyfile_reply("KEY==", &RootProbe::NotReady(driver_text.into()));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body, "mongod not ready");
+    }
+
+    /// The username gate runs BEFORE mongod is asked: with no mongod at all
+    /// on the configured port, a non-root username is still refused (401),
+    /// while the root username reaches the probe and gets the fixed 503.
+    #[tokio::test]
+    async fn keyfile_route_refuses_a_non_root_username_before_asking_mongod() {
+        let port = closed_port().await;
+        let url = serve(member_state(port, Some("KEY=="))).await;
+        let client = reqwest::Client::new();
+
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({ "username": "reader", "password": "pw" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 401);
+        assert_eq!(resp.text().await.unwrap(), "authentication failed");
+
+        let resp = client
+            .post(&url)
+            .json(&serde_json::json!({ "username": "mongo", "password": "pw" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 503);
+        assert_eq!(resp.text().await.unwrap(), "mongod not ready");
+    }
+
+    #[tokio::test]
+    async fn keyfile_route_is_404_on_a_standalone_node() {
+        let port = closed_port().await;
+        let url = serve(member_state(port, None)).await;
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .json(&serde_json::json!({ "username": "mongo", "password": "pw" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
     }
 }

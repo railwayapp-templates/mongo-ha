@@ -42,7 +42,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub const PIN_FILE: &str = ".railway-mongo-auth-pin";
 
@@ -196,7 +196,9 @@ pub async fn resolver(
                         });
                     }
                 }
-                PasswordProbe::NotReady(_) => {}
+                PasswordProbe::NotReady(reason) => {
+                    debug!(%reason, "mongod cannot judge the active password yet")
+                }
             }
         }
 
@@ -229,7 +231,9 @@ pub async fn resolver(
                         });
                     }
                 }
-                PasswordProbe::NotReady(_) => {}
+                PasswordProbe::NotReady(reason) => {
+                    debug!(%reason, "mongod cannot judge the environment password yet")
+                }
             }
         } else if proven {
             return;
