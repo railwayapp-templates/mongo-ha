@@ -770,6 +770,8 @@ t_password_variable_edit_does_not_rotate() {
   # runs on (the pin's), not the edited variable: the freeze and the step-down
   # on the peers must authenticate, and the target must win.
   local sw_primary sw_target sw_code
+  # The old primary was the last node rolled: give the set its election.
+  wait_until 60 "a primary after the roll" any_role_200 mongo-2 mongo-1 mongo-2 mongo-3 || { bad "no primary after the roll"; return; }
   sw_primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" || { bad "no primary after the roll"; return; }
   sw_target="$(printf 'mongo-1\nmongo-2\nmongo-3\n' | grep -v "^$sw_primary$" | tail -1)"
   sw_code="$(switchover_code mongo-2 "$sw_target")"
