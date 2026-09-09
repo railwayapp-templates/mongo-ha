@@ -139,7 +139,11 @@ The `mongo-wrapper` binary (one per data node):
   than "no oplog" stops the node (exit 78) with the fix in its log instead of
   booting over the data. A replica set config left in the `local` database by
   a previous HA life is then dropped — the documented way back to a
-  standalone — so a later re-conversion starts from a clean initiate.
+  standalone — together with the change-stream pre-images collection
+  (`config.system.preimages`: unusable without a replica set, re-created by
+  the next set, and a `--replSet` boot after an unclean standalone stop
+  segfaults in startup recovery when it finds it without an oplog), so a
+  later re-conversion starts from a clean initiate.
 - **Volume runtime lock.** An exclusive `flock` at the data dir root for the
   supervisor's whole life, so an overlapping redeploy waits for the previous
   container instead of racing it on WiredTiger's own lock.

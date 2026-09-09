@@ -20,6 +20,9 @@ use tokio::sync::RwLock;
 const SHORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// A reconfig may wait for the previous config to commit across a majority.
 const RECONFIG_TIMEOUT: Duration = Duration::from_secs(30);
+/// The change-stream pre-images collection every replica set creates in
+/// `config`; dropped with `local` on a revert (see drop_stale_replset_config).
+const PREIMAGES_COLLECTION: &str = "system.preimages";
 
 /// Server error codes this wrapper reasons about, by name — the numbers are
 /// mongod's, stable across every version this image wraps.
@@ -382,17 +385,29 @@ impl Mongo {
     }
 
     /// Standalone mode only: a volume that previously ran as a replica set
-    /// member still carries that set's config in `local.system.replset`, and
-    /// a later re-conversion would load it — with the OLD membership — the
-    /// moment mongod runs with `--replSet` again. The documented way back to
-    /// a clean standalone is to drop the `local` database; this does exactly
-    /// that, and only when such a config exists. Returns whether it did.
+    /// member still carries that set's config in `local.system.replset` — a
+    /// later re-conversion would load it, with the OLD membership, the moment
+    /// mongod runs with `--replSet` again — and the change-stream pre-images
+    /// collection `config.system.preimages`, which every replica set creates.
+    /// The documented way back to a clean standalone is to drop the `local`
+    /// database; this does that, and drops the pre-images collection with
+    /// it: pre-images are unusable without a replica set (no change streams
+    /// on a standalone), the set re-creates the collection, and one left
+    /// behind makes the next `--replSet` boot after an UNCLEAN standalone
+    /// stop segfault in startup recovery (mongod 8.0 startup_recovery.cpp,
+    /// `recoverChangeStreamCollections` skips the oplog-less case only for a
+    /// standalone; `cleanupPreImagesCollectionAfterUncleanShutdown` then
+    /// reads the earliest oplog timestamp through a null oplog pointer once
+    /// `local` is gone — and every retry of that boot is unclean again).
+    /// Runs only when either leftover exists. Returns whether anything was
+    /// dropped.
     ///
-    /// The `root` role carries no `dropDatabase` on `local` (its
-    /// dbAdminAnyDatabase excludes `local` and `config`; the first CI run
-    /// hit `Unauthorized` here), so the drop runs under a temporary
-    /// maintenance role: created, granted to this user, used from a fresh
-    /// connection, then revoked and dropped again — no artifact stays behind.
+    /// The `root` role carries no `dropDatabase` on `local` nor
+    /// `dropCollection` on `config` (its dbAdminAnyDatabase excludes `local`
+    /// and `config`; the first CI run hit `Unauthorized` here), so the drops
+    /// run under a temporary maintenance role: created, granted to this user,
+    /// used from a fresh connection, then revoked and dropped again — no
+    /// artifact stays behind.
     pub async fn drop_stale_replset_config(&self) -> Result<bool> {
         let count = tokio::time::timeout(
             SHORT_COMMAND_TIMEOUT,
@@ -407,7 +422,21 @@ impl Mongo {
         .await
         .map_err(|_| anyhow!("counting local.system.replset timed out"))?
         .context("counting local.system.replset failed")?;
-        if count == 0 {
+        let has_preimages = !tokio::time::timeout(
+            SHORT_COMMAND_TIMEOUT,
+            self.client
+                .read()
+                .await
+                .clone()
+                .database("config")
+                .list_collection_names()
+                .filter(doc! { "name": PREIMAGES_COLLECTION }),
+        )
+        .await
+        .map_err(|_| anyhow!("listing the config database's collections timed out"))?
+        .context("listing the config database's collections failed")?
+        .is_empty();
+        if count == 0 && !has_preimages {
             return Ok(false);
         }
 
@@ -417,10 +446,16 @@ impl Mongo {
             .admin(
                 doc! {
                     "createRole": ROLE,
-                    "privileges": [ {
-                        "resource": { "db": "local", "collection": "" },
-                        "actions": [ "dropDatabase", "dropCollection" ],
-                    } ],
+                    "privileges": [
+                        {
+                            "resource": { "db": "local", "collection": "" },
+                            "actions": [ "dropDatabase", "dropCollection" ],
+                        },
+                        {
+                            "resource": { "db": "config", "collection": PREIMAGES_COLLECTION },
+                            "actions": [ "dropCollection" ],
+                        },
+                    ],
                     "roles": [],
                 },
                 SHORT_COMMAND_TIMEOUT,
@@ -445,10 +480,34 @@ impl Mongo {
         // the version of that guarantee this code does not have to trust).
         let password = self.password.read().await.clone();
         let fresh = client_for(&self.host, self.port, &self.username, &password, true);
-        let dropped = tokio::time::timeout(RECONFIG_TIMEOUT, fresh.database("local").drop())
+        let mut dropped = Ok(());
+        if count > 0 {
+            dropped = tokio::time::timeout(RECONFIG_TIMEOUT, fresh.database("local").drop())
+                .await
+                .map_err(|_| anyhow!("dropping the local database timed out"))
+                .and_then(|r| r.context("dropping the local database failed"));
+        }
+        if dropped.is_ok() && has_preimages {
+            dropped = tokio::time::timeout(
+                RECONFIG_TIMEOUT,
+                fresh
+                    .database("config")
+                    .collection::<Document>(PREIMAGES_COLLECTION)
+                    .drop(),
+            )
             .await
-            .map_err(|_| anyhow!("dropping the local database timed out"))
-            .and_then(|r| r.context("dropping the local database failed"));
+            .map_err(|_| anyhow!("dropping config.system.preimages timed out"))
+            .and_then(|r| match r {
+                Ok(()) => Ok(()),
+                // 26 NamespaceNotFound: gone between the listing and the drop.
+                Err(e) if matches!(e.kind.as_ref(), ErrorKind::Command(c) if c.code == 26) => {
+                    Ok(())
+                }
+                Err(e) => {
+                    Err(anyhow::Error::new(e).context("dropping config.system.preimages failed"))
+                }
+            });
+        }
         fresh.shutdown().await;
 
         // Best effort: the role's job is done either way, and a failure to

@@ -723,6 +723,12 @@ revert_and_reconvert() {
     && ok "stale replica set config dropped on revert" || bad "stale replica set config not dropped"
   [ "$(mongo mongo-1 'db.getSiblingDB("local").system.replset.countDocuments({})' | tr -d '[:space:]')" = "0" ] \
     && ok "local.system.replset is empty on the reverted root" || bad "local.system.replset still holds a config on the reverted root"
+  # Left behind, config.system.preimages makes the re-conversion boot below
+  # (--replSet, after an unclean standalone stop) segfault in mongod's startup
+  # recovery: it reads the earliest oplog timestamp through a null oplog once
+  # local is gone. The revert must drop it with local.
+  [ "$(mongo mongo-1 'db.getSiblingDB("config").getCollectionNames().includes("system.preimages")' | tr -d '[:space:]')" = "false" ] \
+    && ok "change-stream pre-images collection dropped on revert" || bad "config.system.preimages still on the reverted root"
   [ "$(mongo mongo-1 'db.getSiblingDB("admin").system.roles.countDocuments({role: "railwayLocalMaintenance"})' | tr -d '[:space:]')" = "0" ] \
     && ok "the maintenance role left no artifact" || bad "the maintenance role was left behind in admin.system.roles"
   local v
@@ -740,8 +746,11 @@ revert_and_reconvert() {
     bad "reverted root refused a write"
   fi
 
-  # Re-convert: RS_SEEDS back on the root, two fresh replicas. A distinct
-  # phase with its own containers: a failure here gets its own log dump.
+  # Re-convert: RS_SEEDS back on the root, two fresh replicas. The root is
+  # removed with SIGKILL on purpose: the --replSet boot then starts from an
+  # UNCLEAN standalone shutdown, the shape that trips mongod's pre-images
+  # cleanup when the collection was left behind. A distinct phase with its
+  # own containers: a failure here gets its own log dump.
   DUMPED_THIS_SCENARIO=0
   docker rm -f mongo-1 >/dev/null
   start_node 1; start_node 2; start_node 3
