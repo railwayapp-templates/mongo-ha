@@ -16,6 +16,36 @@ pub struct Config {
     pub check_interval: String,
     pub check_fastinter: String,
     pub check_downinter: String,
+    /// Basic-auth account for the stats page when reached over the network.
+    /// Loopback (the in-container monitor and the container healthcheck)
+    /// never authenticates. `None` means no credential is available, and
+    /// remote access to the stats page is denied outright.
+    pub stats_auth: Option<StatsAuth>,
+}
+
+/// Credential guarding the stats page for non-loopback clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsAuth {
+    pub user: String,
+    pub password: String,
+}
+
+/// Resolve the stats credential: `HAPROXY_STATS_USER` / `HAPROXY_STATS_PASSWORD`
+/// when set, else the database account the edge already carries (`MONGOUSER` /
+/// `MONGOPASSWORD` — the template's references to the root account). A blank
+/// password yields `None`.
+pub(crate) fn resolve_stats_auth(
+    stats_user: Option<String>,
+    stats_password: Option<String>,
+    mongo_user: Option<String>,
+    mongo_password: Option<String>,
+) -> Option<StatsAuth> {
+    let non_empty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    let password = non_empty(stats_password).or_else(|| non_empty(mongo_password))?;
+    let user = non_empty(stats_user)
+        .or_else(|| non_empty(mongo_user))
+        .unwrap_or_else(|| "mongo".to_string());
+    Some(StatsAuth { user, password })
 }
 
 impl Config {
@@ -42,6 +72,12 @@ impl Config {
             check_interval: String::env_or("HAPROXY_CHECK_INTERVAL", "3s"),
             check_fastinter: String::env_or("HAPROXY_CHECK_FASTINTER", "500ms"),
             check_downinter: String::env_or("HAPROXY_CHECK_DOWNINTER", "500ms"),
+            stats_auth: resolve_stats_auth(
+                std::env::var("HAPROXY_STATS_USER").ok(),
+                std::env::var("HAPROXY_STATS_PASSWORD").ok(),
+                std::env::var("MONGOUSER").ok(),
+                std::env::var("MONGOPASSWORD").ok(),
+            ),
         })
     }
 }
@@ -79,5 +115,45 @@ mod tests {
         assert_eq!(config.timeout_connect, "10s");
         assert_eq!(config.timeout_check, "3s");
         assert_eq!(config.mongo_port, 27017);
+    }
+
+    fn s(v: &str) -> Option<String> {
+        Some(v.to_string())
+    }
+
+    #[test]
+    fn stats_auth_prefers_explicit_over_database_account() {
+        let auth = resolve_stats_auth(s("ops"), s("secret"), s("mongo"), s("dbpass")).unwrap();
+        assert_eq!(
+            auth,
+            StatsAuth {
+                user: "ops".into(),
+                password: "secret".into()
+            }
+        );
+    }
+
+    #[test]
+    fn stats_auth_falls_back_to_the_database_account() {
+        let auth = resolve_stats_auth(None, None, s("mongo"), s("dbpass")).unwrap();
+        assert_eq!(
+            auth,
+            StatsAuth {
+                user: "mongo".into(),
+                password: "dbpass".into()
+            }
+        );
+    }
+
+    #[test]
+    fn stats_auth_defaults_user_when_only_password_is_known() {
+        let auth = resolve_stats_auth(None, s("secret"), None, None).unwrap();
+        assert_eq!(auth.user, "mongo");
+    }
+
+    #[test]
+    fn stats_auth_is_none_without_a_password() {
+        assert!(resolve_stats_auth(s("ops"), None, s("mongo"), None).is_none());
+        assert!(resolve_stats_auth(None, s("  "), None, s("")).is_none());
     }
 }
