@@ -156,6 +156,18 @@ Edge (`haproxy`): `MONGO_NODES` (comma-separated `host:port`), `MONGO_PORT`
 (default `27017`), `HEALTH_CHECK_PORT` (default `8080`), plus the
 `HAPROXY_*` tunables shared with the other HA edges.
 
+The edge's stats page (`:8404/stats`) is open on loopback — the in-container
+monitor and the healthcheck read it there — and behind HTTP Basic auth for
+every other client: `HAPROXY_STATS_USER` / `HAPROXY_STATS_PASSWORD`, defaulting
+to the `MONGOUSER` / `MONGOPASSWORD` the edge already carries (the root
+account). With no password available at all, remote access is denied. The
+credential reaches haproxy through its environment, so the rendered config the
+entrypoint logs at startup never contains it.
+
+```bash
+curl -u "$MONGOUSER:$MONGOPASSWORD" http://<edge>.railway.internal:8404/stats
+```
+
 ## Images
 
 Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml):
@@ -176,8 +188,11 @@ Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml
   to 5, minority-partition write fence, paused-vs-deleted member pruning,
   revert-and-reconvert, a root-password edit without rotation (pin keeps the
   set together) plus a proper rotation (pin follows), a fresh member joining
-  with a drifted RS_KEY, and the RS_KEY boot guard. Runs on every pull
-  request.
+  with a drifted RS_KEY, the RS_KEY boot guard, and the real edge image in
+  front of the set (writes reach the primary; the stats page is open on
+  loopback, 401 to a remote client without or with a wrong credential, 200
+  with `MONGOUSER:MONGOPASSWORD`, 403 when the edge has no password). Runs on
+  every pull request.
 
 ## Status
 
