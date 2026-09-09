@@ -16,11 +16,14 @@
 //!
 //! Standalone mode (RS_SEEDS unset or RS_ENABLED=false): mongod boots with no
 //! `--replSet` — exactly as the upstream image would — with /health as a real
-//! liveness probe and /role answering 200 while mongod is alive. A replica
-//! set config left on the volume by a previous HA life is dropped, the
-//! documented way, so a later re-conversion starts from a clean initiate.
-//! This is the state a reverted (HA → standalone) service runs in while it
-//! still uses this image.
+//! liveness probe and /role answering 200 while mongod is alive. A volume that
+//! ran as a replica set member first replays its oplog through a loopback-only
+//! recovery mongod (standalone_recovery.rs): without `--replSet` mongod does
+//! no startup recovery, and a plain boot would drop every collection created
+//! after the last checkpoint. A replica set config left on the volume by a
+//! previous HA life is dropped, the documented way, so a later re-conversion
+//! starts from a clean initiate. This is the state a reverted (HA →
+//! standalone) service runs in while it still uses this image.
 
 mod auth_pin;
 mod config;
@@ -32,6 +35,7 @@ mod mongo;
 mod peers;
 mod process_manager;
 mod rs;
+mod standalone_recovery;
 mod volume_lock;
 
 use anyhow::Result;
@@ -144,6 +148,9 @@ async fn main() -> Result<()> {
         flags.push("--dbpath".to_string());
         flags.push(config.data_dir.clone());
     }
+    // MONGO_INITDB_ROOT_USERNAME/PASSWORD reach docker-entrypoint.sh through
+    // the inherited process environment, not as CLI args.
+    let args: Vec<String> = std::env::args().skip(1).collect();
 
     if config.rs_enabled() {
         let keyfile = creds
@@ -177,6 +184,26 @@ async fn main() -> Result<()> {
         ));
     } else {
         info!("RS_SEEDS not set (or RS_ENABLED=false) — standalone passthrough mode");
+        // A volume that ran as a set member replays its oplog first (see
+        // standalone_recovery.rs); the real standalone mongod below then
+        // opens a data dir that already holds every write the set took.
+        if standalone_recovery::replay_needed(has_data, pin.as_ref()) {
+            match standalone_recovery::replay_oplog_as_standalone(&config, &args).await {
+                Ok(outcome) => info!(?outcome, "starting the standalone mongod"),
+                Err(e) => {
+                    // Fail-stop with the data dir untouched: the log carries
+                    // the fix, the restart policy retries the boot.
+                    let error = format!("{e:#}");
+                    tracing::error!("{error}");
+                    telemetry.send_once(TelemetryEvent::ComponentError {
+                        component: "mongo-wrapper".to_string(),
+                        error,
+                        context: "standalone-recovery".to_string(),
+                    });
+                    std::process::exit(standalone_recovery::RECOVERY_FAIL_EXIT_CODE);
+                }
+            }
+        }
         tokio::spawn(health_server::run_health_server_supervised(
             config.health_port,
             Arc::new(AppState {
@@ -205,9 +232,6 @@ async fn main() -> Result<()> {
         telemetry.clone(),
     ));
 
-    // MONGO_INITDB_ROOT_USERNAME/PASSWORD reach docker-entrypoint.sh through
-    // the inherited process environment, not as CLI args.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let child = process_manager::spawn_mongod(&flags, &args).await?;
 
     // HA mode: hand the primary role off before mongod is signaled, so a
