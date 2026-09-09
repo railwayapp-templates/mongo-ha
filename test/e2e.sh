@@ -20,6 +20,10 @@ ROOT_PW="e2e-root-pw"
 RS_KEY="e2e-shared-key"
 RS_NAME="rs0"
 SEEDS="mongo-1:27017,mongo-2:27017,mongo-3:27017"
+# The edge scenario runs the REAL HAProxy image. CI pre-builds it under this
+# tag (cache-warmed); a local run without it builds it on first use — inside
+# the scenario, so subset runs of other scenarios never pay the cargo build.
+EDGE_IMAGE="${EDGE_IMAGE:-mongo-ha-e2e-haproxy:3.2}"
 
 PASS=0
 FAIL=0
@@ -297,6 +301,67 @@ t_set_forms_and_replicates() {
   else
     ok "secondary refuses direct writes"
   fi
+}
+
+ensure_edge_image() {
+  docker image inspect "$EDGE_IMAGE" >/dev/null 2>&1 && return 0
+  log "building $EDGE_IMAGE"
+  docker build -q -t "$EDGE_IMAGE" -f haproxy/Dockerfile . >/dev/null
+}
+
+# edge_http_code <from-node> <url> [wget args...] — the HTTP status one GET
+# got (000 when nothing answered): the stats-page assertions must tell a 401
+# from a 403 from a 200, which wget's exit code alone cannot.
+edge_http_code() {
+  local from="$1" url="$2"; shift 2
+  docker exec "$from" wget -S -O /dev/null --tries=1 "$@" "$url" 2>&1 \
+    | awk '/^  HTTP\/[0-9.]+ [0-9][0-9][0-9]/{code=$2} END{print (code ? code : "000")}'
+}
+
+basic_auth_header() {
+  printf 'Authorization: Basic %s' "$(printf '%s:%s' "$1" "$2" | base64 | tr -d '\n')"
+}
+
+# The real edge in front of the running trio. Writes through it land on the
+# primary, and its stats page is open on loopback (the in-container monitor
+# and the healthcheck read it there), HTTP Basic for anyone else with the
+# root account the edge carries as MONGOUSER/MONGOPASSWORD, and denied
+# outright on an edge with no password to check against.
+t_edge_routes_writes_and_authenticates_stats() {
+  log "t_edge_routes_writes_and_authenticates_stats (reuses the running trio + the real edge image)"
+  set_is_fully_online mongo-1 || { ensure_trio; wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }; }
+  ensure_edge_image || { bad "edge image build failed"; return; }
+  docker rm -f mongo-edge mongo-edge-open >/dev/null 2>&1
+  docker run -d --label "$LABEL" --name mongo-edge --hostname mongo-edge --network "$NET" --network-alias mongo-edge \
+    -e MONGO_NODES="$SEEDS" -e MONGOUSER="$ROOT_USER" -e MONGOPASSWORD="$ROOT_PW" "$EDGE_IMAGE" >/dev/null
+  docker run -d --label "$LABEL" --name mongo-edge-open --hostname mongo-edge-open --network "$NET" --network-alias mongo-edge-open \
+    -e MONGO_NODES="$SEEDS" "$EDGE_IMAGE" >/dev/null
+
+  wait_until 60 "edge answers /stats on loopback" bash -c 'docker exec mongo-edge wget -q -O /dev/null --tries=1 http://127.0.0.1:8404/stats' \
+    || { bad "the edge never answered /stats on loopback"; docker rm -f mongo-edge mongo-edge-open >/dev/null 2>&1; return; }
+  ok "loopback GET /stats is open on the edge (password configured)"
+  wait_until 60 "a client through the edge reaches the primary" \
+    bash -c "docker exec mongo-2 mongosh --quiet 'mongodb://$ROOT_USER:$ROOT_PW@mongo-edge:27017/admin?directConnection=true' --eval 'db.hello().isWritablePrimary' 2>/dev/null | grep -q true" \
+    && ok "a client through the edge reaches the primary" || bad "the edge did not route to the primary"
+
+  local code
+  code="$(edge_http_code mongo-2 http://mongo-edge:8404/stats)"
+  [ "$code" = 401 ] && ok "remote GET /stats without a credential answers 401" || bad "remote GET /stats without a credential answered $code, want 401"
+  code="$(edge_http_code mongo-2 http://mongo-edge:8404/stats --header "$(basic_auth_header "$ROOT_USER" not-the-password)")"
+  [ "$code" = 401 ] && ok "remote GET /stats with a wrong password answers 401" || bad "remote GET /stats with a wrong password answered $code, want 401"
+  code="$(edge_http_code mongo-2 http://mongo-edge:8404/stats --header "$(basic_auth_header "$ROOT_USER" "$ROOT_PW")")"
+  [ "$code" = 200 ] && ok "remote GET /stats with MONGOUSER:MONGOPASSWORD answers 200" || bad "remote GET /stats with MONGOUSER:MONGOPASSWORD answered $code, want 200"
+  if docker logs mongo-edge 2>&1 | grep -qF "$ROOT_PW"; then
+    bad "the edge logged the stats password"
+  else
+    ok "the edge's startup log (rendered config included) carries no stats password"
+  fi
+
+  wait_until 60 "open edge answers /stats on loopback" bash -c 'docker exec mongo-edge-open wget -q -O /dev/null --tries=1 http://127.0.0.1:8404/stats' \
+    && ok "loopback GET /stats is open on an edge with no password" || bad "the edge with no password never answered /stats on loopback"
+  code="$(edge_http_code mongo-2 http://mongo-edge-open:8404/stats)"
+  [ "$code" = 403 ] && ok "remote GET /stats is denied (403) on an edge with no password to check" || bad "remote GET /stats on the edge with no password answered $code, want 403"
+  docker rm -f mongo-edge mongo-edge-open >/dev/null 2>&1
 }
 
 t_failover_on_primary_pause() {
@@ -839,6 +904,7 @@ t_missing_rs_key_refuses_boot() {
 
 ALL_TESTS=(
   t_set_forms_and_replicates
+  t_edge_routes_writes_and_authenticates_stats
   t_failover_on_primary_pause
   t_cold_restart_preserves_set
   t_switchover_promotes_requested_node
