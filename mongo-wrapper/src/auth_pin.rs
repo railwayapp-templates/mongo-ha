@@ -68,16 +68,44 @@ pub fn read_pin(data_dir: &str) -> Option<AuthPin> {
     serde_json::from_str(&raw).ok()
 }
 
-/// Persist the pin atomically (temp file + rename), owner-only readable.
+/// Persist the pin atomically (temp file + rename), owner-only readable from
+/// its first byte: the temp file is born 0600 (see open_private), the body is
+/// written and synced, then the file is renamed into place.
 pub fn write_pin(data_dir: &str, pin: &AuthPin) -> Result<()> {
+    use std::io::Write;
+
     let path = pin_path(data_dir);
     let tmp = path.with_extension("tmp");
     let body = serde_json::to_string(pin).context("serializing the auth pin")?;
-    fs::write(&tmp, body).with_context(|| format!("writing {}", tmp.display()))?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod {}", tmp.display()))?;
+    let mut file = open_private(&tmp)?;
+    file.write_all(body.as_bytes())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing {}", tmp.display()))?;
+    drop(file);
     fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
     Ok(())
+}
+
+/// Create (or truncate) `path` for writing, mode 0600 from the moment it
+/// exists. `fs::write` would create it with the umask's default — 0644 under
+/// the usual 022 — and a chmod afterwards leaves a window in which the root
+/// password sits world-readable on the volume. `mode` applies only on
+/// creation, so a temp file left behind by an interrupted earlier attempt has
+/// its bits reset explicitly while it is still empty.
+fn open_private(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod {}", path.display()))?;
+    Ok(file)
 }
 
 /// What this boot should run with, resolved from the pin and the environment.
@@ -323,6 +351,37 @@ mod tests {
         assert_eq!(mode, 0o600);
         fs::write(pin_path(d), "not json").unwrap();
         assert!(read_pin(d).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_pin_is_private_from_its_first_byte_even_over_a_leftover_temp_file() {
+        let dir = std::env::temp_dir().join(format!("mongo-auth-pin-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+
+        // A fresh temp file is born owner-only, before a byte is written.
+        let fresh = dir.join("fresh.tmp");
+        let file = open_private(&fresh).unwrap();
+        let mode = fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "created with mode 0600, not the umask default");
+        drop(file);
+
+        // A torn earlier attempt left a world-readable temp file behind: it is
+        // truncated and made private before the body goes in.
+        let tmp = pin_path(d).with_extension("tmp");
+        fs::write(&tmp, "stale").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+        let pin = AuthPin {
+            password: "pw".into(),
+            keyfile: None,
+        };
+        write_pin(d, &pin).unwrap();
+        assert!(!tmp.exists(), "the temp file was renamed into place");
+        let mode = fs::metadata(pin_path(d)).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(read_pin(d), Some(pin));
         fs::remove_dir_all(&dir).ok();
     }
 }
