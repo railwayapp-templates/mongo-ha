@@ -655,68 +655,160 @@ t_paused_member_is_not_pruned() {
     && ok "paused member rejoined" || bad "paused member did not rejoin"
 }
 
-t_revert_to_standalone_and_reconvert() {
-  log "t_revert_to_standalone_and_reconvert (fresh trio)"
+# revert_and_reconvert <clean|crash> — the revert flow on a fresh trio, then a
+# re-conversion from the reverted volume. The canary is written on the root
+# (w: majority) right before the root goes down; the platform deletes the
+# replicas and re-creates the root on its volume WITHOUT RS_SEEDS/RS_ENABLED,
+# same image. `clean` stops the root the way the platform does (SIGTERM, 60 s
+# grace: mongod's shutdown checkpoint runs); `crash` kills it (SIGKILL — a
+# crash or OOM before the redeploy) the moment the canary is acknowledged, so
+# the write sits in the oplog and in no checkpoint: only the oplog replay the
+# wrapper runs before the standalone mongod can bring it back (a boot that
+# skips it logs mongod id 22251 for the canary's collection and drops it).
+revert_and_reconvert() {
+  local mode="$1"
   teardown_trio
   start_trio
-  wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }
+  wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return 1; }
   local primary
-  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" || { bad "no primary before the revert"; return; }
-  mongo "$primary" 'db.getSiblingDB("t").kv.replaceOne({_id: 9}, {_id: 9, v: "before-revert"}, {upsert: true, writeConcern: {w: "majority"}})' | grep -q acknowledged \
-    || { bad "pre-revert write was not acknowledged"; return; }
-  # The revert keeps the ROOT; make sure it is the primary holding the write
-  # (it usually is — a fresh trio's mongo-1 initiates — but never assume).
+  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" || { bad "no primary before the revert"; return 1; }
+  # The revert keeps the ROOT; make sure it is the primary (it usually is — a
+  # fresh trio's mongo-1 initiates — but never assume).
   if [ "$primary" != "mongo-1" ]; then
     switchover_code mongo-2 mongo-1 >/dev/null
     wait_until 60 "root is primary before the revert" bash -c '[ "$(docker exec mongo-2 wget -q -O /dev/null http://mongo-1:8080/role 2>/dev/null && echo 200 || echo 503)" = 200 ]' \
-      || { bad "root could not reclaim primary before the revert"; return; }
+      || { bad "root could not reclaim primary before the revert"; return 1; }
   fi
 
-  # Revert: the platform deletes the replicas and strips RS_SEEDS/RS_ENABLED
-  # from the root, which reboots standalone on the same image and volume.
-  docker rm -f mongo-2 mongo-3 >/dev/null
+  # A collection created for the occasion, so it postdates the last checkpoint.
+  mongo mongo-1 'db.getSiblingDB("t").revert.insertOne({_id: 9, v: "before-revert"}, {writeConcern: {w: "majority"}})' | grep -q acknowledged \
+    || { bad "pre-revert write was not acknowledged"; return 1; }
+  case "$mode" in
+    crash)
+      # Kill, then remove at once: the container's restart policy must not
+      # get a chance to boot mongod again before the volume is reused.
+      docker kill mongo-1 >/dev/null
+      docker rm -f mongo-1 >/dev/null 2>&1
+      log "root SIGKILLed right after the acknowledged write (no shutdown checkpoint)"
+      ;;
+    clean)
+      docker rm -f mongo-2 mongo-3 >/dev/null
+      docker stop -t 60 mongo-1 >/dev/null
+      log "replicas deleted; root stopped with SIGTERM (shutdown checkpoint taken)"
+      ;;
+  esac
+  docker rm -f mongo-1 mongo-2 mongo-3 >/dev/null 2>&1
   docker volume rm mongo-ha-e2e-vol-2 mongo-ha-e2e-vol-3 >/dev/null 2>&1
-  docker rm -f mongo-1 >/dev/null
-  docker run -d --label "$LABEL" --restart unless-stopped \
-    --name mongo-1 --hostname mongo-1 --network "$NET" --network-alias mongo-1 \
-    -v "mongo-ha-e2e-vol-1:/data/db" \
-    -e MONGO_INITDB_ROOT_USERNAME="$ROOT_USER" -e MONGO_INITDB_ROOT_PASSWORD="$ROOT_PW" \
-    -e RAILWAY_PRIVATE_DOMAIN=mongo-1 -e RAILWAY_ENVIRONMENT_ID=e2e-env \
-    -e RAILWAY_VOLUME_MOUNT_PATH=/data/db \
-    "$IMAGE" >/dev/null
+  # The reverted root: the HA volume, no RS_SEEDS. A fresh container each
+  # time (not `docker restart`), so each boot's log stands on its own.
+  start_reverted_root() {
+    docker run -d --label "$LABEL" --restart unless-stopped \
+      --name mongo-1 --hostname mongo-1 --network "$NET" --network-alias mongo-1 \
+      -v "mongo-ha-e2e-vol-1:/data/db" \
+      -e MONGO_INITDB_ROOT_USERNAME="$ROOT_USER" -e MONGO_INITDB_ROOT_PASSWORD="$ROOT_PW" \
+      -e RAILWAY_PRIVATE_DOMAIN=mongo-1 -e RAILWAY_ENVIRONMENT_ID=e2e-env \
+      -e RAILWAY_VOLUME_MOUNT_PATH=/data/db \
+      "$IMAGE" >/dev/null
+  }
+  start_reverted_root
 
-  wait_until 120 "reverted root answers /role 200 standalone" bash -c '[ "$(docker exec mongo-1 wget -q -O /dev/null http://127.0.0.1:8080/role 2>/dev/null && echo 200 || echo 503)" = 200 ]' \
-    || { bad "reverted root never became writable"; return; }
-  ok "reverted root serves standalone"
+  wait_until 180 "reverted root answers /role 200 standalone" bash -c '[ "$(docker exec mongo-1 wget -q -O /dev/null http://127.0.0.1:8080/role 2>/dev/null && echo 200 || echo 503)" = 200 ]' \
+    || { bad "reverted root never became writable ($mode stop)"; return 1; }
+  ok "reverted root serves standalone ($mode stop)"
+  # The volume ran as a set member (its pin carries a keyfile): the wrapper
+  # must have replayed the oplog through the recovery mongod BEFORE the
+  # standalone one, whichever way the root went down.
+  node_logged mongo-1 "replaying the oplog first" \
+    && ok "reverted root ran the recovery boot before the standalone mongod" || bad "reverted root skipped the recovery boot"
+  node_logged mongo-1 "recovery boot finished" \
+    && ok "recovery boot checkpointed and handed over" || bad "recovery boot did not finish"
+  docker exec mongo-1 test ! -e /data/db/.railway-mongo-replset \
+    && ok "replica set boot record cleared once the replay was checkpointed" || bad "replica set boot record still on the volume after the replay"
   wait_until 60 "stale replica set config dropped" bash -c 'docker logs mongo-1 2>&1 | grep -F "dropped the replica set config" >/dev/null' \
     && ok "stale replica set config dropped on revert" || bad "stale replica set config not dropped"
   [ "$(mongo mongo-1 'db.getSiblingDB("local").system.replset.countDocuments({})' | tr -d '[:space:]')" = "0" ] \
     && ok "local.system.replset is empty on the reverted root" || bad "local.system.replset still holds a config on the reverted root"
+  # Left behind, config.system.preimages makes the re-conversion boot below
+  # (--replSet, after an unclean standalone stop) segfault in mongod's startup
+  # recovery: it reads the earliest oplog timestamp through a null oplog once
+  # local is gone. The revert must drop it with local.
+  [ "$(mongo mongo-1 'db.getSiblingDB("config").getCollectionNames().includes("system.preimages")' | tr -d '[:space:]')" = "false" ] \
+    && ok "change-stream pre-images collection dropped on revert" || bad "config.system.preimages still on the reverted root"
   [ "$(mongo mongo-1 'db.getSiblingDB("admin").system.roles.countDocuments({role: "railwayLocalMaintenance"})' | tr -d '[:space:]')" = "0" ] \
     && ok "the maintenance role left no artifact" || bad "the maintenance role was left behind in admin.system.roles"
   local v
-  v="$(mongo mongo-1 'db.getSiblingDB("t").kv.findOne({_id: 9}).v')"
+  v="$(mongo mongo-1 'db.getSiblingDB("t").revert.findOne({_id: 9}).v')"
   if [ "$v" = "before-revert" ]; then
-    ok "data intact after revert"
+    ok "data intact after revert ($mode stop)"
   else
-    log "revert read diagnostics: $(mongo_diag mongo-1 'JSON.stringify({doc: db.getSiblingDB("t").kv.findOne({_id: 9}), count: db.getSiblingDB("t").kv.countDocuments({}), dbs: db.adminCommand({listDatabases: 1, nameOnly: true}).databases.map(d => d.name)})' | tail -3)"
-    bad "data lost on revert (got '$v')"
+    log "revert read diagnostics: $(mongo_diag mongo-1 'JSON.stringify({doc: db.getSiblingDB("t").revert.findOne({_id: 9}), count: db.getSiblingDB("t").revert.countDocuments({}), dbs: db.adminCommand({listDatabases: 1, nameOnly: true}).databases.map(d => d.name)})' | tail -3)"
+    log "idents dropped by the standalone boot: $(docker logs mongo-1 2>&1 | grep -c '"id":22251')"
+    bad "data lost on revert after a $mode stop (got '$v')"
   fi
-  if mongo mongo-1 'db.getSiblingDB("t").kv.insertOne({_id: 10, v: "standalone-write"})' | grep -q acknowledged; then
+  if mongo mongo-1 'db.getSiblingDB("t").revert.insertOne({_id: 10, v: "standalone-write"})' | grep -q acknowledged; then
     ok "reverted root accepts writes"
   else
     bad "reverted root refused a write"
   fi
 
-  # Re-convert: RS_SEEDS back on the root, two fresh replicas.
+  # The replay runs ONCE per revert. The standalone resolver re-pins without a
+  # keyfile once the password is proven; with the boot record already cleared,
+  # the volume then carries no record of set-member life, and a second
+  # standalone boot must go straight to mongod. (Without the re-pin the
+  # recovery mongod would run on every boot of this volume, forever.)
+  wait_until 90 "standalone resolver re-pinned without a keyfile" \
+    bash -c 'docker exec mongo-1 grep -q "\"keyfile\":null" /data/db/.railway-mongo-auth-pin' \
+    && ok "standalone boot retired the pinned keyfile (the once-per-revert latch)" \
+    || { bad "the reverted root's pin still carries a keyfile: $(docker exec mongo-1 sed 's/"password":"[^"]*"/"password":"***"/' /data/db/.railway-mongo-auth-pin 2>&1)"; }
+  docker stop -t 60 mongo-1 >/dev/null
+  docker rm -f mongo-1 >/dev/null 2>&1
+  start_reverted_root
+  wait_until 180 "reverted root serves again after a second standalone boot" bash -c '[ "$(docker exec mongo-1 wget -q -O /dev/null http://127.0.0.1:8080/role 2>/dev/null && echo 200 || echo 503)" = 200 ]' \
+    || { bad "reverted root did not come back on its second standalone boot"; return 1; }
+  if node_logged mongo-1 "replaying the oplog first"; then
+    bad "second standalone boot ran the recovery mongod again (the replay must run once per revert)"
+  else
+    ok "second standalone boot skipped the recovery mongod (replay ran once per revert)"
+  fi
+  docker exec mongo-1 test ! -e /data/db/.railway-mongo-replset \
+    && ok "no replica set boot record after the second standalone boot" || bad "a replica set boot record reappeared on a standalone boot"
+  v="$(mongo mongo-1 'db.getSiblingDB("t").revert.findOne({_id: 9}).v')"
+  [ "$v" = "before-revert" ] && ok "pre-revert data intact after the second standalone boot" || bad "pre-revert data missing after the second standalone boot (got '$v')"
+  v="$(mongo mongo-1 'db.getSiblingDB("t").revert.findOne({_id: 10}).v')"
+  [ "$v" = "standalone-write" ] && ok "standalone-era write intact after the second standalone boot" || bad "standalone-era write missing after the second standalone boot (got '$v')"
+
+  # Re-convert: RS_SEEDS back on the root, two fresh replicas. The root is
+  # removed with SIGKILL on purpose: the --replSet boot then starts from an
+  # UNCLEAN standalone shutdown, the shape that trips mongod's pre-images
+  # cleanup when the collection was left behind. A distinct phase with its
+  # own containers: a failure here gets its own log dump.
+  DUMPED_THIS_SCENARIO=0
   docker rm -f mongo-1 >/dev/null
   start_node 1; start_node 2; start_node 3
   wait_until 300 "3 healthy after re-conversion" set_is_fully_online mongo-1 \
-    || { bad "re-conversion did not form a set"; return; }
+    || { bad "re-conversion did not form a set"; return 1; }
   ok "re-converted from the reverted volume"
   [ "$(role_code mongo-2 mongo-1)" = "200" ] && ok "adopted root is the primary again (its data won the initiate tie-break)" || bad "the reverted root is not the primary after re-conversion"
-  v="$(mongo mongo-3 'db.getSiblingDB("t").kv.findOne({_id: 10}).v')"
+  docker exec mongo-1 test -e /data/db/.railway-mongo-replset \
+    && ok "re-converted root records its replica set boot on the volume again" || bad "re-converted root left no replica set boot record"
+  v="$(mongo mongo-3 'db.getSiblingDB("t").revert.findOne({_id: 10}).v')"
   [ "$v" = "standalone-write" ] && ok "standalone-era write reached a fresh replica" || bad "standalone-era write missing on replica (got '$v')"
+  # A member's boot with --replSet replays natively: the standalone recovery
+  # is not part of an HA boot (the second-standalone-boot case is asserted
+  # above, before the re-conversion).
+  [ "$(docker logs mongo-1 2>&1 | grep -c 'replaying the oplog first')" = "0" ] \
+    && ok "re-converted root did not run the standalone recovery (HA boot recovers natively)" \
+    || bad "re-converted root ran the standalone recovery boot"
+}
+
+t_revert_to_standalone_and_reconvert() {
+  log "t_revert_to_standalone_and_reconvert (fresh trio; root stopped with SIGTERM, as the platform does)"
+  revert_and_reconvert clean
+}
+
+t_revert_after_crash_preserves_unflushed_writes() {
+  log "t_revert_after_crash_preserves_unflushed_writes (fresh trio; root SIGKILLed right after the write)"
+  revert_and_reconvert crash
 }
 
 # restart_node_with_env <n> <extra docker args...> — re-creates mongo-N on its
@@ -850,6 +942,7 @@ ALL_TESTS=(
   t_paused_member_is_not_pruned
   t_deleted_member_is_pruned
   t_revert_to_standalone_and_reconvert
+  t_revert_after_crash_preserves_unflushed_writes
   t_password_variable_edit_does_not_rotate
   t_fresh_member_adopts_live_keyfile
   t_missing_rs_key_refuses_boot

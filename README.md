@@ -123,9 +123,27 @@ The `mongo-wrapper` binary (one per data node):
   against a root password the peer verifies on its own mongod.
 - **Standalone mode.** Without `RS_SEEDS` (or with `RS_ENABLED=false`, which
   the revert flow sets) mongod runs with no `--replSet`, exactly as the
-  upstream image would. A replica set config left in the `local` database by
-  a previous HA life is dropped — the documented way back to a standalone —
-  so a later re-conversion starts from a clean initiate.
+  upstream image would. A volume that ran as a replica set member (every HA
+  boot records it on the volume before mongod spawns; a volume from an older
+  image is recognised by the keyfile in its credential pin) first replays its
+  oplog: a member's
+  collections are not journaled — durability is the journaled oplog plus
+  stable checkpoints, replayed on every `--replSet` boot — and a boot without
+  `--replSet` performs no replay, so after a crash before the redeploy (or
+  with writes past the majority commit point after a clean stop) mongod drops
+  every collection created after the last checkpoint as an unknown ident.
+  The wrapper runs a loopback-only recovery mongod with
+  `recoverFromOplogAsStandalone=true` and `takeUnstableCheckpointOnShutdown=true`,
+  stops it cleanly so the replayed state is checkpointed, and only then starts
+  the standalone mongod; a recovery mongod that fails for any reason other
+  than "no oplog" stops the node (exit 78) with the fix in its log instead of
+  booting over the data. A replica set config left in the `local` database by
+  a previous HA life is then dropped — the documented way back to a
+  standalone — together with the change-stream pre-images collection
+  (`config.system.preimages`: unusable without a replica set, re-created by
+  the next set, and a `--replSet` boot after an unclean standalone stop
+  segfaults in startup recovery when it finds it without an oplog), so a
+  later re-conversion starts from a clean initiate.
 - **Volume runtime lock.** An exclusive `flock` at the data dir root for the
   supervisor's whole life, so an overlapping redeploy waits for the previous
   container instead of racing it on WiredTiger's own lock.
@@ -174,8 +192,11 @@ Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml
   replication, failover on primary pause, cold restart, switchover, demote
   on SIGTERM, wiped-volume rejoin, standalone-volume conversion, scale-up
   to 5, minority-partition write fence, paused-vs-deleted member pruning,
-  revert-and-reconvert, a root-password edit without rotation (pin keeps the
-  set together) plus a proper rotation (pin follows), a fresh member joining
+  revert-and-reconvert after a clean stop and after a SIGKILL (the crash
+  variant is the one a boot without the oplog replay fails: the canary's
+  collection is dropped as an unknown ident), a root-password edit without
+  rotation (pin keeps the set together) plus a proper rotation (pin follows),
+  a fresh member joining
   with a drifted RS_KEY, and the RS_KEY boot guard. Runs on every pull
   request.
 

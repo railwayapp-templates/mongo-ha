@@ -23,13 +23,22 @@ use tracing::{error, info, warn};
 pub async fn spawn_mongod(flags: &[String], args: &[String]) -> Result<Child> {
     info!(?flags, ?args, "starting docker-entrypoint.sh mongod");
 
-    Command::new("docker-entrypoint.sh")
+    mongod_command(flags, args)
+        .spawn()
+        .context("failed to spawn docker-entrypoint.sh mongod")
+}
+
+/// The `docker-entrypoint.sh mongod [flags...] [args...]` command, not yet
+/// spawned, for a caller that needs to shape its stdio first (the recovery
+/// boot reads mongod's log to reach its verdict, see standalone_recovery.rs).
+pub fn mongod_command(flags: &[String], args: &[String]) -> Command {
+    let mut command = Command::new("docker-entrypoint.sh");
+    command
         .arg("mongod")
         .args(flags)
         .args(args)
-        .kill_on_drop(false)
-        .spawn()
-        .context("failed to spawn docker-entrypoint.sh mongod")
+        .kill_on_drop(false);
+    command
 }
 
 /// Supervise the mongod child: forward SIGTERM/SIGINT and wait for a graceful

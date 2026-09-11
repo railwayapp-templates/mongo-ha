@@ -679,14 +679,15 @@ async fn prune_round(
     let _ = config;
 }
 
-/// Standalone mode: wait for mongod, then clear any replica set config a
-/// previous HA life left behind (see Mongo::drop_stale_replset_config).
+/// Standalone mode: wait for mongod, then clear what a previous HA life left
+/// behind — the replica set config and the change-stream pre-images
+/// collection (see Mongo::drop_stale_replset_config).
 pub async fn standalone_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemetry>) {
     wait_for_final_mongod(&mongo, &config).await;
     match mongo.drop_stale_replset_config().await {
         Ok(true) => warn!(
-            "dropped the replica set config left by a previous HA life (local database); \
-             this node runs standalone now"
+            "dropped the replica set config left by a previous HA life (local database) and \
+             its change-stream pre-images collection; this node runs standalone now"
         ),
         Ok(false) => {}
         Err(e) => {
