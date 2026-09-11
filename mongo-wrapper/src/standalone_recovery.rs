@@ -54,8 +54,15 @@
 //! a volume that only ever ran standalone there is no oplog, and the recovery
 //! boot is fatal there (log id 31364, "Recovery not possible, no oplog
 //! found"). The marker is cleared once the replay is checkpointed (or found
-//! nothing to replay), and the standalone resolver re-pins without a keyfile,
-//! so the replay runs exactly once per revert. The marker, not the pin, is
+//! nothing to replay), and the standalone boot resolves no keyfile
+//! (`auth_pin::resolve_boot_credentials` with no `RS_KEY`), so the resolver's
+//! write-back once the password is proven leaves a pin without one — the
+//! replay runs once per revert on either record. A node that dies before that
+//! proof replays again on its next boot, which mongod makes safe: with
+//! `takeUnstableCheckpointOnShutdown` a second `recoverFromOplogAsStandalone`
+//! on an already-replayed data dir only confirms nothing is left to apply
+//! (`ReplicationRecoveryImpl::recoverFromOplogAsStandalone`, log ids 21537/
+//! 21538, "safely idempotent when it succeeds"). The marker, not the pin, is
 //! the primary signal because the pin is proof-gated: it is written once the
 //! root password has been proven against the live mongod, typically ~30s
 //! into the first boot, and a member reverted before that would have no
@@ -456,6 +463,34 @@ mod tests {
         assert!(!replay_needed(true, false, Some(&standalone)));
         // No record at all (upstream-image volume, torn pin): today's boot.
         assert!(!replay_needed(true, false, None));
+    }
+
+    #[test]
+    fn the_replay_runs_once_per_revert() {
+        let member = AuthPin {
+            password: "pw".into(),
+            keyfile: Some("K==".into()),
+        };
+        // First standalone boot of a reverted volume: both records present.
+        assert!(replay_needed(true, true, Some(&member)));
+        // After it: the marker is cleared and the standalone resolver re-pins
+        // without a keyfile (auth_pin::resolve_boot_credentials) — the next
+        // standalone boot must not run the recovery mongod again.
+        let retired = crate::auth_pin::resolve_boot_credentials(Some(&member), "pw", None, None);
+        let repinned = AuthPin {
+            password: retired.password,
+            keyfile: retired.keyfile,
+        };
+        assert_eq!(repinned.keyfile, None);
+        assert!(!replay_needed(true, false, Some(&repinned)));
+        // A volume from an image without the marker replays once for the same
+        // reason: the pin is the only record, and the re-pin retires it.
+        assert!(replay_needed(true, false, Some(&member)));
+        assert!(!replay_needed(true, false, Some(&repinned)));
+        // Killed before the resolver proved the password: the old pin stays
+        // and the next boot replays again — safe, mongod only confirms there
+        // is nothing left to apply (see the module doc).
+        assert!(replay_needed(true, false, Some(&member)));
     }
 
     #[test]
