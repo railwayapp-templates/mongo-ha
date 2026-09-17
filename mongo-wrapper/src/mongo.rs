@@ -466,7 +466,7 @@ impl Mongo {
     /// `local.oplog.rs` specifically (backups need it), so no extra
     /// privilege is required here.
     pub async fn oplog_window(&self) -> Result<Option<Duration>> {
-        let client = self.client.read().await.clone();
+        let client = self.pooled().await.0;
         let oplog = client.database("local").collection::<Document>("oplog.rs");
         let first = tokio::time::timeout(
             SHORT_COMMAND_TIMEOUT,
