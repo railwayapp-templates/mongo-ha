@@ -434,6 +434,8 @@ mod tests {
             bootstrap_dwell_seconds: 15,
             demote_timeout_ms: 20_000,
             peer_gone_dwell_seconds: 1800,
+            health_api_username: "railway".into(),
+            health_api_password: None,
         }
     }
 
