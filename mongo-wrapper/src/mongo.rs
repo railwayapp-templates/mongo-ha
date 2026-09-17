@@ -584,10 +584,9 @@ impl Mongo {
         .context("counting local.system.replset failed")?;
         let has_preimages = !tokio::time::timeout(
             SHORT_COMMAND_TIMEOUT,
-            self.client
-                .read()
+            self.pooled()
                 .await
-                .clone()
+                .0
                 .database("config")
                 .list_collection_names()
                 .filter(doc! { "name": PREIMAGES_COLLECTION }),
