@@ -423,7 +423,8 @@ t_conversion_adopts_standalone_volume() {
     bash -c 'docker exec mongo-1 mongosh --quiet "mongodb://'"$ROOT_USER:$ROOT_PW"'@127.0.0.1:27017/admin" --eval "db.runCommand({ping:1}).ok" 2>/dev/null | grep -q 1' \
     || { bad "upstream standalone never came up"; return; }
   docker exec mongo-1 mongosh --quiet "mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin" \
-    --eval 'db.getSiblingDB("app").docs.insertMany([{_id: 1, v: "pre-conversion"}, {_id: 2, v: "keep-me"}])' >/dev/null 2>&1
+    --eval 'const r = db.getSiblingDB("app").docs.insertMany([{_id: 1, v: "pre-conversion"}, {_id: 2, v: "keep-me"}], {writeConcern: {w: 1, j: true}}); if (!r.acknowledged) quit(1)' \
+    || { bad "pre-conversion seed write was not acknowledged"; return; }
   docker rm -f mongo-1 >/dev/null
 
   # Conversion: the root reboots on the wrapper image with RS_SEEDS, keeping
