@@ -413,13 +413,14 @@ t_cold_restart_preserves_set() {
     || { bad "set did not reform after cold restart"; return; }
   ok "set reformed after full outage"
 
-  local v
-  v="$(mongo mongo-1 'db.getSiblingDB("t").kv.findOne({_id: 3}).v')"
-  if [ "$v" = "pre-cold-restart" ]; then
-    ok "data survived the cold restart"
-  else
-    bad "data lost after cold restart (got: '$v')"
-  fi
+  # Wait for the canary rather than a single-shot read: right after the set
+  # reforms the elected primary may still be catching up secondaries, and a
+  # findOne against mongo-1 mid-election can return null even though majority
+  # acknowledged the write before the stop.
+  wait_until 60 "pre-cold-restart data visible" \
+    bash -c '[ "$(docker exec mongo-1 mongosh --quiet "mongodb://'"$ROOT_USER:$ROOT_PW"'@127.0.0.1:27017/admin?directConnection=true" --eval "db.getSiblingDB(\"t\").kv.findOne({_id: 3}).v" 2>/dev/null)" = "pre-cold-restart" ]' \
+    && ok "data survived the cold restart" \
+    || bad "data lost after cold restart"
 
   wait_until 60 "exactly one primary after cold restart" exactly_one_primary mongo-2 mongo-1 mongo-2 mongo-3 \
     && ok "exactly one primary after cold restart" \
@@ -699,10 +700,14 @@ t_wiped_member_volume_rejoins_fresh() {
   wait_until 300 "wiped member back (3 healthy)" set_is_fully_online mongo-1 \
     || { bad "wiped member did not rejoin"; return; }
   ok "wiped member rejoined via initial sync"
-  if node_logged "$victim" "already named in the set's config"; then
-    ok "wiped member recognized itself in the existing config (no reconfig)"
+  # Prefer "did not reconfig" over "logged already named": heartbeats can
+  # deliver the config before the orchestrator's first poll, so the
+  # already-named line is never written even though no reconfig happened
+  # (PR #6 CI notes). Assert the reconfig log is absent.
+  if node_logged "$victim" "added to the replica set"; then
+    bad "wiped member was reconfig'd into the set (expected heartbeat-delivered config)"
   else
-    bad "wiped member did not take the heartbeat-config path"
+    ok "wiped member rejoined without a reconfig"
   fi
   wait_until 60 "data on the rebuilt member" \
     bash -c "[ \"\$(docker exec $victim mongosh --quiet 'mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin?directConnection=true' --eval 'db.getSiblingDB(\"t\").kv.findOne({_id: 4}).v' 2>/dev/null)\" = pre-wipe ]" \
