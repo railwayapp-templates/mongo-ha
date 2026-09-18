@@ -63,8 +63,11 @@ decisions:
   primary, whether it holds user data, and this node's own current oplog
   window (`oplog_window_seconds`, see Monitoring below). Consumed by peers'
   initiate guards.
-- `POST /rs/keyfile` — the set's keyfile, to a caller that proves the root
-  password (JSON `{username, password}`, verified against this node's mongod).
+- `POST /rs/keyfile` — the set's keyfile, to the root account only: the JSON
+  `{username, password}` must name the configured root username, authenticate
+  against this node's mongod, and that session must hold the `root` role on
+  `admin` (`connectionStatus`). Anything else — a wrong password, or an
+  `admin` user without `root` — is a 401.
 - `POST /switchover` — ask THIS node to become the primary (Railway's
   "Make Leader"). Freezes the other secondaries, steps the current primary
   down with a catch-up window, and answers 200 once this node has won.
@@ -79,8 +82,9 @@ base64(HEALTH_API_USERNAME:HEALTH_API_PASSWORD)` (username default
 realm="railway-ha"` to a missing, malformed or wrong credential. The reads
 (`/health`, `/role`, `/rs/state`) never require it — HAProxy's routing probe
 and the peers' initiate guards read them — and `POST /rs/keyfile` keeps its
-own credential, the root password proven against this node's mongod, which
-is the one secret a fresh member is guaranteed to hold.
+own credential: the configured root username and password proven against this
+node's mongod, with the `root` role confirmed on that session — the one secret
+a fresh member is guaranteed to hold.
 
 Unset, the route is open, so a running set adopts enforcement without a
 window where anything fails: callers send the credential whenever the node
@@ -110,7 +114,11 @@ The `mongo-wrapper` binary (one per data node):
 - **Keyfile.** Derives the internal-authentication keyfile from the shared
   `RS_KEY` (sha256 → base64) and writes it for mongod before spawning it;
   `--keyFile` implies authentication, so the root account the upstream
-  entrypoint creates is enforced cluster-wide.
+  entrypoint creates is enforced cluster-wide. The keyfile is the unsalted
+  SHA-256 of `RS_KEY`, and the template stamps `RS_KEY` as a reference to the
+  root password, so the keyfile is a deterministic function of that password:
+  whoever holds the root password can derive it, the same trust the
+  `/rs/keyfile` exchange grants.
 - **Initiate guard.** mongod persists its replica set config and re-forms the
   set by itself on every restart; the one decision it does not make is how a
   node WITHOUT a config becomes a member. The wrapper queries its declared
@@ -143,8 +151,9 @@ The `mongo-wrapper` binary (one per data node):
   outranks the environment at boot, the drift is logged and reported, and a
   properly rotated stored user (`db.changeUserPassword`, then the variable)
   is adopted live. A node with no pin that finds a live set adopts that set's
-  keyfile from a peer over `POST /rs/keyfile`, which hands it out only
-  against a root password the peer verifies on its own mongod.
+  keyfile from a peer over `POST /rs/keyfile`, which hands it out only to
+  the root account: username and password verified on the peer's own mongod,
+  and the `root` role confirmed on that session.
 - **Pooled connection after initial sync.** The wrapper's admin connection
   authenticates once per pooled socket. On a member that joined by initial
   sync, the root user it logged in as is the one the entrypoint created on the
@@ -277,10 +286,12 @@ Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml
   variant is the one a boot without the oplog replay fails: the canary's
   collection is dropped as an unknown ident), a root-password edit without
   rotation (pin keeps the set together) plus a proper rotation (pin follows),
-  a fresh member joining with a drifted RS_KEY, the RS_KEY boot guard, and
-  the health server's Basic auth on `POST /switchover` (401 without or with
-  a wrong credential, 200 with it, reads and `/rs/keyfile` open, unset =
-  open). Runs on every pull request.
+  a fresh member joining with a drifted RS_KEY (with the keyfile exchange
+  refusing a non-root `admin` user and a wrong password, and handing the
+  root account the live keyfile), the RS_KEY boot guard, and the health
+  server's Basic auth on `POST /switchover` (401 without or with a wrong
+  credential, 200 with it, reads and `/rs/keyfile` open, unset = open).
+  Runs on every pull request.
 
 ## Status
 
