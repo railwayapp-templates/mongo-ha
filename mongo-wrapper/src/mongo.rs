@@ -438,6 +438,23 @@ impl Mongo {
             .next()
             .cloned()
             .unwrap_or_else(|| "?".to_string());
+        // A role update can invalidate pooled authentication before the
+        // coordinator reaches this member. Only a proven staged credential
+        // may replace it; edited variables are never trusted here.
+        if self.host == "127.0.0.1" {
+            if let Ok(config) = crate::config::Config::from_env() {
+                if let Some(pending) = crate::credentials::pending_password(&config.data_dir) {
+                    if *self.password.read().await != pending
+                        && matches!(
+                            self.probe_local_password(&pending).await,
+                            PasswordProbe::Works
+                        )
+                    {
+                        self.swap_password(&pending).await;
+                    }
+                }
+            }
+        }
         let (client, generation) = self.pooled().await;
         match run_admin(&client, command.clone(), timeout, &name).await {
             Err(e) if is_lost_session(&e) => {

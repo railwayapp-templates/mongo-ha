@@ -52,16 +52,39 @@ pub fn mongod_command(flags: &[String], args: &[String]) -> Command {
 pub async fn supervise(
     mut child: Child,
     demote: Option<crate::demote_on_shutdown::DemoteCtx>,
+    config: std::sync::Arc<crate::config::Config>,
+    flags: Vec<String>,
+    args: Vec<String>,
 ) -> Result<()> {
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
 
-    let pid = child.id().map(|id| Pid::from_raw(id as i32));
+    let mut pid = child.id().map(|id| Pid::from_raw(id as i32));
 
-    // Every arm below ends the process — the "loop" runs at most once.
-    #[allow(clippy::never_loop)]
     loop {
         tokio::select! {
+            _ = crate::credentials::RESTART_MONGO.notified() => {
+                let Some(target) = crate::auth_pin::read_pin(&config.data_dir).and_then(|pin| pin.keyfile) else { continue; };
+                if crate::credentials::loaded_keyfile().as_ref() == Some(&target) { continue; }
+                let Some(ctx) = &demote else { continue; };
+                // Unlike a container shutdown, rotation must refuse to stop a
+                // primary unless the planned, catch-up-aware handoff succeeds.
+                let handoff = async {
+                    if ctx.mongo.hello().await?.is_writable_primary {
+                        ctx.mongo.step_down(60, 10).await?;
+                    }
+                    anyhow::ensure!(!ctx.mongo.hello().await?.is_writable_primary, "still primary");
+                    anyhow::Ok(())
+                };
+                if !matches!(tokio::time::timeout(std::time::Duration::from_secs(20), handoff).await, Ok(Ok(()))) {
+                    continue;
+                }
+                crate::keyfile::write_keyfile_content(&config.keyfile_path, &target)?;
+                graceful_shutdown(pid, &mut child).await;
+                child = spawn_mongod(&flags, &args).await?;
+                pid = child.id().map(|id| Pid::from_raw(id as i32));
+                crate::credentials::set_loaded_keyfile(target);
+            }
             status = child.wait() => {
                 let code = match status {
                     Ok(s) => {

@@ -84,7 +84,9 @@ async fn rs_keyfile(
     State(state): State<Arc<AppState>>,
     Json(req): Json<KeyfileRequest>,
 ) -> impl IntoResponse {
-    let Some(keyfile) = state.keyfile.as_ref() else {
+    let Some(keyfile) =
+        crate::credentials::loaded_keyfile().or_else(|| state.keyfile.as_deref().cloned())
+    else {
         return (
             StatusCode::NOT_FOUND,
             "not a replica set member".to_string(),
@@ -93,7 +95,7 @@ async fn rs_keyfile(
     // Nothing closes the semaphore; a closed one is treated like "cannot
     // judge" rather than a panic inside a request handler.
     let Ok(_slot) = KEYFILE_PROBES.acquire().await else {
-        return keyfile_reply(keyfile, &RootProbe::NotReady("probe slots closed".into()));
+        return keyfile_reply(&keyfile, &RootProbe::NotReady("probe slots closed".into()));
     };
     // Any other account is refused before mongod is even asked: the exchange
     // is for the root account, and a valid password for some other user must
@@ -119,7 +121,7 @@ async fn rs_keyfile(
             warn!(error = %e, "/rs/keyfile: mongod could not judge the credential")
         }
     }
-    keyfile_reply(keyfile, &probe)
+    keyfile_reply(&keyfile, &probe)
 }
 
 /// What /rs/keyfile answers for a probe outcome. The bodies are fixed strings:
@@ -249,7 +251,7 @@ async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             Mongo::connect_member(
                 host,
                 &state.config.mongo_root_username,
-                &state.config.mongo_root_password,
+                &crate::auth_pin::active_password(&state.config),
             )
         };
         for host in &others {
@@ -329,6 +331,9 @@ async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 /// The open routes, with the mutating one merged in behind `guard`.
+/// `/credentials/rotate` authenticates with the pinned root password itself
+/// (see credentials.rs), so it sits beside the reads rather than behind the
+/// HEALTH_API_PASSWORD gate that protects `/switchover`.
 fn router(state: Arc<AppState>, guard: Guard) -> Router {
     let mutating =
         health_auth::protect(Router::new().route("/switchover", post(switchover)), guard);
@@ -337,6 +342,7 @@ fn router(state: Arc<AppState>, guard: Guard) -> Router {
         .route("/role", get(role))
         .route("/rs/state", get(rs_state))
         .route("/rs/keyfile", post(rs_keyfile))
+        .route("/credentials/rotate", post(crate::credentials::rotate))
         .merge(mutating)
         .with_state(state)
 }
@@ -383,6 +389,7 @@ pub async fn run_health_server_supervised(
     guard: Guard,
     telemetry: Arc<Telemetry>,
 ) {
+    tokio::spawn(crate::credentials::reconcile(state.clone()));
     let mut alerted_for_current_incident = false;
 
     loop {

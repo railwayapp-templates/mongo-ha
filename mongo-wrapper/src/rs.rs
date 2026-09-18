@@ -323,6 +323,12 @@ async fn query_peers(
 /// peer holds a set, none answers, or none accepts the credentials — the
 /// caller then derives from the environment, exactly the pre-pin behavior.
 pub async fn discover_live_set_keyfile(config: &Config) -> Option<String> {
+    discover_live_set_keyfile_with_password(config, &crate::auth_pin::active_password(config)).await
+}
+pub async fn discover_live_set_keyfile_with_password(
+    config: &Config,
+    password: &str,
+) -> Option<String> {
     let http = reqwest::Client::new();
     let peer_hosts = config.peer_hosts();
     if peer_hosts.is_empty() {
@@ -346,7 +352,7 @@ pub async fn discover_live_set_keyfile(config: &Config) -> Option<String> {
             config.health_port,
             timeout,
             &config.mongo_root_username,
-            &config.mongo_root_password,
+            password,
         )
         .await
         {
@@ -370,7 +376,7 @@ async fn add_self_through_primary(
     let primary = Mongo::connect_member(
         primary_host,
         &config.mongo_root_username,
-        &config.mongo_root_password,
+        &crate::auth_pin::active_password(config),
     );
     let current = primary
         .rs_config()
