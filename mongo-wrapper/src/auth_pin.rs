@@ -327,6 +327,13 @@ pub async fn resolver(
     }
 }
 
+/// Peer operations must use the same live credential as the local pool.
+pub fn active_password(config: &crate::config::Config) -> String {
+    read_pin(&config.data_dir)
+        .map(|p| p.password)
+        .unwrap_or_else(|| config.mongo_root_password.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,11 +482,4 @@ mod tests {
         assert_eq!(read_pin(d), Some(pin));
         fs::remove_dir_all(&dir).ok();
     }
-}
-
-/// Peer operations must use the same live credential as the local pool.
-pub fn active_password(config: &crate::config::Config) -> String {
-    read_pin(&config.data_dir)
-        .map(|p| p.password)
-        .unwrap_or_else(|| config.mongo_root_password.clone())
 }

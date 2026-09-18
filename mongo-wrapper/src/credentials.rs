@@ -318,39 +318,6 @@ pub async fn reconcile(state: Arc<AppState>) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn two_pass_keys_overlap_then_revoke_the_original() {
-        let request = Rotation {
-            operation: Operation::KeyPrepare,
-            new_password: "target".into(),
-            current_password: "previous".into(),
-        };
-        let keys: Vec<String> = serde_json::from_str(&target_keyfile(&request, true)).unwrap();
-        assert_eq!(
-            keys,
-            vec![
-                crate::keyfile::derive_keyfile_content("previous"),
-                crate::keyfile::derive_keyfile_content("target")
-            ]
-        );
-        assert_eq!(target_keyfile(&request, false), keys[1]);
-        let reverse = Rotation {
-            operation: Operation::KeyPrepare,
-            new_password: "previous".into(),
-            current_password: "target".into(),
-        };
-        let rollback: Vec<String> = serde_json::from_str(&target_keyfile(&reverse, true)).unwrap();
-        assert!(rollback.iter().all(|key| keys.contains(key)));
-        assert_eq!(target_keyfile(&reverse, false), keys[0]);
-        assert!(keys_overlap(&target_keyfile(&request, true), &keys[0]));
-        assert!(keys_overlap(&target_keyfile(&request, true), &keys[1]));
-        assert!(!keys_overlap(&keys[0], &keys[1]));
-    }
-}
-
 fn keys_overlap(left: &str, right: &str) -> bool {
     let keys = |text: &str| {
         serde_json::from_str::<Vec<String>>(text).unwrap_or_else(|_| vec![text.trim().into()])
@@ -397,4 +364,37 @@ pub async fn reconcile_keyfile_at_boot(config: &crate::config::Config) -> anyhow
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn two_pass_keys_overlap_then_revoke_the_original() {
+        let request = Rotation {
+            operation: Operation::KeyPrepare,
+            new_password: "target".into(),
+            current_password: "previous".into(),
+        };
+        let keys: Vec<String> = serde_json::from_str(&target_keyfile(&request, true)).unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                crate::keyfile::derive_keyfile_content("previous"),
+                crate::keyfile::derive_keyfile_content("target")
+            ]
+        );
+        assert_eq!(target_keyfile(&request, false), keys[1]);
+        let reverse = Rotation {
+            operation: Operation::KeyPrepare,
+            new_password: "previous".into(),
+            current_password: "target".into(),
+        };
+        let rollback: Vec<String> = serde_json::from_str(&target_keyfile(&reverse, true)).unwrap();
+        assert!(rollback.iter().all(|key| keys.contains(key)));
+        assert_eq!(target_keyfile(&reverse, false), keys[0]);
+        assert!(keys_overlap(&target_keyfile(&request, true), &keys[0]));
+        assert!(keys_overlap(&target_keyfile(&request, true), &keys[1]));
+        assert!(!keys_overlap(&keys[0], &keys[1]));
+    }
 }
