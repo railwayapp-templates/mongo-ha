@@ -17,11 +17,21 @@
 //! local admin commands with them.
 //!
 //! HEALTH_API_PASSWORD (with HEALTH_API_USERNAME, default `railway`) gates the
-//! health server's mutating route — see health_auth.rs.
+//! health server's mutating route — see health_auth.rs. Both are read the way
+//! the platform callers read them: trimmed, and a blank value is the same as
+//! an unset one (the username falls back to `railway`, the password leaves
+//! the route open — with a warning, since a present-but-blank password looks
+//! configured and is not).
 
 use crate::health_auth::Credential;
 use anyhow::{bail, Context, Result};
 use common::{ConfigExt, RailwayEnv};
+use tracing::warn;
+
+/// The username the platform sends when `HEALTH_API_USERNAME` is unset or
+/// blank; the image must resolve the same default or the two sides compare
+/// different strings forever.
+pub const DEFAULT_HEALTH_API_USERNAME: &str = "railway";
 
 pub struct Config {
     /// Root account the upstream entrypoint creates on a fresh data dir and
@@ -50,6 +60,7 @@ pub struct Config {
     pub keyfile_path: String,
     pub health_port: u16,
     /// Username `POST /switchover` is authenticated as (see health_auth.rs).
+    /// `HEALTH_API_USERNAME` trimmed; unset or blank → `railway`.
     pub health_api_username: String,
     /// Password `POST /switchover` requires; None (unset, or only
     /// whitespace) leaves the route open. Leading/trailing whitespace is
@@ -84,6 +95,14 @@ impl Config {
         let mongo_root_password = String::env_required("MONGO_INITDB_ROOT_PASSWORD")
             .context("MONGO_INITDB_ROOT_PASSWORD must be set")?;
 
+        let health_api_password_raw = std::env::var("HEALTH_API_PASSWORD").ok();
+        if health_api_password_is_blank(health_api_password_raw.as_deref()) {
+            warn!(
+                "HEALTH_API_PASSWORD is set but blank: treated as unset, so POST /switchover \
+                 stays open; set it to a non-blank value to require authentication"
+            );
+        }
+
         let config = Self {
             mongo_root_username,
             mongo_root_password,
@@ -95,9 +114,10 @@ impl Config {
             rs_key: non_empty(std::env::var("RS_KEY").ok()),
             keyfile_path: String::env_or("RS_KEYFILE_PATH", "/run/mongo-ha/keyfile"),
             health_port: u16::env_parse("HEALTH_PORT", 8080),
-            health_api_username: String::env_or("HEALTH_API_USERNAME", "railway"),
-            health_api_password: non_empty(std::env::var("HEALTH_API_PASSWORD").ok())
-                .map(|p| p.trim().to_string()),
+            health_api_username: health_api_username_from(
+                std::env::var("HEALTH_API_USERNAME").ok(),
+            ),
+            health_api_password: health_api_password_from(health_api_password_raw),
             private_domain: RailwayEnv::private_domain(),
             data_dir: non_empty(std::env::var("DATA_DIR").ok())
                 .or_else(|| non_empty(std::env::var("RAILWAY_VOLUME_MOUNT_PATH").ok()))
@@ -190,6 +210,28 @@ fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
 
+/// `HEALTH_API_USERNAME` as the health server compares it: trimmed, and
+/// `railway` when unset or blank — the platform callers resolve it the same
+/// way, so `" ops "` means `ops` on both sides and an emptied variable does
+/// not silently switch the image to an empty username nobody sends.
+pub(crate) fn health_api_username_from(raw: Option<String>) -> String {
+    non_empty(raw)
+        .map(|u| u.trim().to_string())
+        .unwrap_or_else(|| DEFAULT_HEALTH_API_USERNAME.to_string())
+}
+
+/// `HEALTH_API_PASSWORD` as the health server compares it: trimmed; unset or
+/// blank → None, the route stays open.
+pub(crate) fn health_api_password_from(raw: Option<String>) -> Option<String> {
+    non_empty(raw).map(|p| p.trim().to_string())
+}
+
+/// Present but blank — the one shape that looks configured and is not; the
+/// boot log says so (see from_env).
+pub(crate) fn health_api_password_is_blank(raw: Option<&str>) -> bool {
+    raw.is_some_and(|p| p.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,12 +308,35 @@ mod tests {
 
     #[test]
     fn health_api_password_env_is_trimmed_and_blank_means_unset() {
-        // Same shape from_env applies: non_empty() then trim().
-        let resolve =
-            |raw: Option<&str>| non_empty(raw.map(str::to_string)).map(|p| p.trim().to_string());
+        let resolve = |raw: Option<&str>| health_api_password_from(raw.map(str::to_string));
         assert_eq!(resolve(None), None);
         assert_eq!(resolve(Some("")), None);
         assert_eq!(resolve(Some("   ")), None);
         assert_eq!(resolve(Some(" pw ")), Some("pw".to_string()));
+        assert_eq!(resolve(Some("pw")), Some("pw".to_string()));
+    }
+
+    /// The username must resolve exactly as the platform callers resolve it
+    /// (trim, blank → `railway`), or a stray space in the variable is a
+    /// permanent 401.
+    #[test]
+    fn health_api_username_env_is_trimmed_and_blank_means_default() {
+        let resolve = |raw: Option<&str>| health_api_username_from(raw.map(str::to_string));
+        assert_eq!(resolve(None), "railway");
+        assert_eq!(resolve(Some("")), "railway");
+        assert_eq!(resolve(Some("   ")), "railway");
+        assert_eq!(resolve(Some(" ops ")), "ops");
+        assert_eq!(resolve(Some("ops")), "ops");
+        assert_eq!(DEFAULT_HEALTH_API_USERNAME, "railway");
+    }
+
+    /// Only a present-but-blank password is the warned shape: unset is the
+    /// documented open default, a real value enforces.
+    #[test]
+    fn a_blank_password_is_the_one_shape_worth_a_warning() {
+        assert!(!health_api_password_is_blank(None));
+        assert!(health_api_password_is_blank(Some("")));
+        assert!(health_api_password_is_blank(Some("  \t")));
+        assert!(!health_api_password_is_blank(Some(" pw ")));
     }
 }
