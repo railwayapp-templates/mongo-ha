@@ -5,6 +5,25 @@
 //! 503s instead of hanging them; membership operations (an initiate, a
 //! reconfig, a step-down that waits for a secondary to catch up) get their
 //! own, longer bounds at the call site.
+//!
+//! ## The pooled session and initial sync
+//!
+//! The driver authenticates a pooled connection once, when it is established,
+//! and mongod keeps that connection's user in a session cache. On a member that
+//! joined by INITIAL SYNC the pool logged in as the root user docker-entrypoint
+//! created on this node's fresh volume; the sync then drops `admin` and clones
+//! the set's copy, whose root document carries a different userId. The next
+//! write to `admin.system.users` invalidates mongod's user cache, the session
+//! refresh finds the id changed and logs the connection out
+//! (`AuthorizationManagerImpl::reacquireUser`: "User id from privilege document
+//! does not match user id in session" → UserNotFound → server log id 20245
+//! "Removed deleted user from session cache of user information"), and from
+//! then on every command on that connection fails with code 13 "requires
+//! authentication" — while a fresh connection with the same password
+//! authenticates fine. The driver re-authenticates only on code 391 (OIDC),
+//! never on 13. So `admin` treats a code 13 as a lost session: it rebuilds the
+//! pool with the active password, once per observed pool generation, and
+//! retries the command once.
 
 use anyhow::{anyhow, bail, Context, Result};
 use mongodb::bson::{doc, Bson, Document};
@@ -16,10 +35,14 @@ use mongodb::Client;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 const SHORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// A reconfig may wait for the previous config to commit across a majority.
 const RECONFIG_TIMEOUT: Duration = Duration::from_secs(30);
+/// The change-stream pre-images collection every replica set creates in
+/// `config`; dropped with `local` on a revert (see drop_stale_replset_config).
+const PREIMAGES_COLLECTION: &str = "system.preimages";
 
 /// Server error codes this wrapper reasons about, by name — the numbers are
 /// mongod's, stable across every version this image wraps.
@@ -36,6 +59,10 @@ pub mod codes {
     pub const NOT_WRITABLE_PRIMARY: i32 = 10107;
     /// `replSetStepDown` found no secondary caught up within the window.
     pub const EXCEEDED_TIME_LIMIT: i32 = 262;
+    /// The connection carries no authenticated user (or lacks a privilege).
+    /// On a pool that authenticated at connection time this means mongod
+    /// logged the session out underneath the driver — see the module doc.
+    pub const UNAUTHORIZED: i32 = 13;
 }
 
 /// What `hello` said about the server behind this connection.
@@ -67,6 +94,34 @@ pub struct RsMember {
     pub state_str: String,
     pub healthy: bool,
     pub is_self: bool,
+    /// Seconds since the Unix epoch of this member's last applied optime
+    /// (`optime.ts`, the BSON Timestamp every member reports — not the
+    /// human-readable `optimeDate`, so lag arithmetic stays in the same
+    /// integer-seconds unit `Mongo::oplog_window` reads off the oplog itself).
+    /// None when the member has not applied anything yet (freshly added,
+    /// still in initial sync) or the server does not report it.
+    pub optime_secs: Option<u32>,
+}
+
+/// Parse one `replSetGetStatus` `members[]` row. Split out from `rs_status`
+/// so the shape can be fed synthetic BSON documents in tests — see
+/// `replication_monitor`'s derivation tests, which build members this way
+/// rather than requiring a live replica set.
+fn member_from_doc(m: &Document) -> RsMember {
+    RsMember {
+        id: bson_int(m.get("_id")).unwrap_or(-1),
+        host: m.get_str("name").unwrap_or("").to_string(),
+        state: bson_int(m.get("state")).unwrap_or(-1) as i32,
+        state_str: m.get_str("stateStr").unwrap_or("").to_string(),
+        healthy: m.get_f64("health").map(|h| h >= 1.0).unwrap_or(false)
+            || bson_int(m.get("health")).map(|h| h >= 1).unwrap_or(false),
+        is_self: m.get_bool("self").unwrap_or(false),
+        optime_secs: m
+            .get_document("optime")
+            .ok()
+            .and_then(|d| d.get_timestamp("ts").ok())
+            .map(|ts| ts.time),
+    }
 }
 
 /// The node's replica set status, or the fact that it has none.
@@ -92,6 +147,14 @@ pub mod states {
     pub const PRIMARY: i32 = 1;
 }
 
+/// The pooled client and how many times it has been replaced. The generation
+/// lets concurrent callers that all saw the same logged-out session agree on
+/// ONE rebuild instead of each replacing the other's fresh pool.
+struct Pool {
+    client: Client,
+    generation: u64,
+}
+
 #[derive(Clone)]
 pub struct Mongo {
     host: String,
@@ -99,13 +162,14 @@ pub struct Mongo {
     username: String,
     /// The password the pooled client currently authenticates with; kept so
     /// a throwaway client (fresh authorization, see drop_stale_replset_config)
-    /// can be built with the same identity.
+    /// and a rebuilt pool can be built with the same identity.
     password: Arc<RwLock<String>>,
     /// Swappable: built with the boot-time password (the pin's, when one
-    /// exists), and replaced by the credential resolver once it has proven a
-    /// different password against the live server (see auth_pin.rs). Every
+    /// exists), replaced by the credential resolver once it has proven a
+    /// different password against the live server (see auth_pin.rs), and
+    /// rebuilt when mongod logs its session out (see the module doc). Every
     /// clone of this handle observes the swap.
-    client: Arc<RwLock<Client>>,
+    pool: Arc<RwLock<Pool>>,
 }
 
 const PASSWORD_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -155,6 +219,26 @@ pub fn command_error_code(e: &anyhow::Error) -> Option<i32> {
             ErrorKind::Command(c) => Some(c.code),
             _ => None,
         })
+}
+
+/// A reply saying the connection is not authenticated (code 13). Code 13 also
+/// covers a genuine privilege refusal; that one survives the single retry a
+/// rebuilt pool gets and is returned as is.
+pub fn is_lost_session(e: &anyhow::Error) -> bool {
+    command_error_code(e) == Some(codes::UNAUTHORIZED)
+}
+
+/// One admin command on a given client, bounded by `timeout`.
+async fn run_admin(
+    client: &Client,
+    command: Document,
+    timeout: Duration,
+    name: &str,
+) -> Result<Document> {
+    tokio::time::timeout(timeout, client.database("admin").run_command(command))
+        .await
+        .map_err(|_| anyhow!("{name} timed out after {timeout:?}"))?
+        .map_err(|e| anyhow::Error::new(e).context(format!("{name} failed")))
 }
 
 fn client_for(host: &str, port: u16, username: &str, password: &str, direct: bool) -> Client {
@@ -210,13 +294,10 @@ impl Mongo {
             port,
             username: username.to_string(),
             password: Arc::new(RwLock::new(password.to_string())),
-            client: Arc::new(RwLock::new(client_for(
-                "127.0.0.1",
-                port,
-                username,
-                password,
-                true,
-            ))),
+            pool: Arc::new(RwLock::new(Pool {
+                client: client_for("127.0.0.1", port, username, password, true),
+                generation: 0,
+            })),
         }
     }
 
@@ -225,8 +306,41 @@ impl Mongo {
     /// live server, never speculatively.
     pub async fn swap_password(&self, password: &str) {
         let fresh = client_for(&self.host, self.port, &self.username, password, true);
-        let old = std::mem::replace(&mut *self.client.write().await, fresh);
-        *self.password.write().await = password.to_string();
+        let old = {
+            let mut pool = self.pool.write().await;
+            *self.password.write().await = password.to_string();
+            pool.generation += 1;
+            std::mem::replace(&mut pool.client, fresh)
+        };
+        old.shutdown().await;
+    }
+
+    /// The pooled client and the generation it belongs to.
+    async fn pooled(&self) -> (Client, u64) {
+        let pool = self.pool.read().await;
+        (pool.client.clone(), pool.generation)
+    }
+
+    /// Rebuild the pool after a command on generation `observed` came back
+    /// Unauthorized (see the module doc). A caller that lost the race — the
+    /// pool is already past that generation — does nothing and retries on
+    /// the pool it finds.
+    async fn reauthenticate(&self, observed: u64) {
+        let old = {
+            let mut pool = self.pool.write().await;
+            if pool.generation != observed {
+                return;
+            }
+            let password = self.password.read().await.clone();
+            let fresh = client_for(&self.host, self.port, &self.username, &password, true);
+            pool.generation += 1;
+            warn!(
+                host = %self.host,
+                generation = pool.generation,
+                "mongod dropped the pooled connection's authenticated session (code 13); rebuilt the pool with the active password"
+            );
+            std::mem::replace(&mut pool.client, fresh)
+        };
         old.shutdown().await;
     }
 
@@ -240,9 +354,10 @@ impl Mongo {
     pub fn connect_member(addr: &str, username: &str, password: &str) -> Self {
         let (host, port) = split_host_port(addr);
         Self {
-            client: Arc::new(RwLock::new(client_for(
-                &host, port, username, password, true,
-            ))),
+            pool: Arc::new(RwLock::new(Pool {
+                client: client_for(&host, port, username, password, true),
+                generation: 0,
+            })),
             host,
             port,
             username: username.to_string(),
@@ -256,11 +371,19 @@ impl Mongo {
             .next()
             .cloned()
             .unwrap_or_else(|| "?".to_string());
-        let client = self.client.read().await.clone();
-        tokio::time::timeout(timeout, client.database("admin").run_command(command))
-            .await
-            .map_err(|_| anyhow!("{name} timed out after {timeout:?}"))?
-            .map_err(|e| anyhow::Error::new(e).context(format!("{name} failed")))
+        let (client, generation) = self.pooled().await;
+        match run_admin(&client, command.clone(), timeout, &name).await {
+            Err(e) if is_lost_session(&e) => {
+                // mongod logged this pooled connection out (see the module
+                // doc); a fresh pool authenticates again with the active
+                // password. Retried once: a code 13 that survives a fresh
+                // authentication is a real authorization verdict.
+                self.reauthenticate(generation).await;
+                let (client, _) = self.pooled().await;
+                run_admin(&client, command, timeout, &name).await
+            }
+            outcome => outcome,
+        }
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -293,15 +416,7 @@ impl Mongo {
                     .map(|arr| {
                         arr.iter()
                             .filter_map(Bson::as_document)
-                            .map(|m| RsMember {
-                                id: bson_int(m.get("_id")).unwrap_or(-1),
-                                host: m.get_str("name").unwrap_or("").to_string(),
-                                state: bson_int(m.get("state")).unwrap_or(-1) as i32,
-                                state_str: m.get_str("stateStr").unwrap_or("").to_string(),
-                                healthy: m.get_f64("health").map(|h| h >= 1.0).unwrap_or(false)
-                                    || bson_int(m.get("health")).map(|h| h >= 1).unwrap_or(false),
-                                is_self: m.get_bool("self").unwrap_or(false),
-                            })
+                            .map(member_from_doc)
                             .collect()
                     })
                     .unwrap_or_default();
@@ -333,6 +448,55 @@ impl Mongo {
         d.get_document("config")
             .cloned()
             .context("replSetGetConfig answered without a config")
+    }
+
+    /// This node's own oplog window: the wall-clock span, in whole seconds,
+    /// between the oldest and newest entries in `local.oplog.rs` right now —
+    /// the same computation the shell's `db.getReplicationInfo()` runs
+    /// (oldest/newest by `$natural` order, diffed). `None` when the oplog is
+    /// empty (a member that has taken no writes yet, or one whose oplog was
+    /// just created) rather than an error: an empty oplog is not a read
+    /// failure.
+    ///
+    /// A raw collection read, not an admin command, because there is no
+    /// `replSetGetStatus`-style command for this — the shell helper itself
+    /// queries the collection directly. Reads `local` the same way
+    /// `drop_stale_replset_config`'s count already does: the `root` role
+    /// includes the built-in `backup` role, which is granted read access to
+    /// `local.oplog.rs` specifically (backups need it), so no extra
+    /// privilege is required here.
+    pub async fn oplog_window(&self) -> Result<Option<Duration>> {
+        let client = self.pooled().await.0;
+        let oplog = client.database("local").collection::<Document>("oplog.rs");
+        let first = tokio::time::timeout(
+            SHORT_COMMAND_TIMEOUT,
+            oplog.find_one(doc! {}).sort(doc! { "$natural": 1 }),
+        )
+        .await
+        .map_err(|_| anyhow!("reading the oldest oplog entry timed out"))?
+        .context("reading the oldest oplog entry failed")?;
+        let Some(first) = first else {
+            return Ok(None);
+        };
+        let last = tokio::time::timeout(
+            SHORT_COMMAND_TIMEOUT,
+            oplog.find_one(doc! {}).sort(doc! { "$natural": -1 }),
+        )
+        .await
+        .map_err(|_| anyhow!("reading the newest oplog entry timed out"))?
+        .context("reading the newest oplog entry failed")?;
+        let Some(last) = last else {
+            return Ok(None);
+        };
+        let (Some(first_ts), Some(last_ts)) = (
+            first.get_timestamp("ts").ok(),
+            last.get_timestamp("ts").ok(),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(Duration::from_secs(
+            last_ts.time.saturating_sub(first_ts.time) as u64,
+        )))
     }
 
     /// Initiate a brand-new single-member set with this node as member 0.
@@ -382,24 +546,35 @@ impl Mongo {
     }
 
     /// Standalone mode only: a volume that previously ran as a replica set
-    /// member still carries that set's config in `local.system.replset`, and
-    /// a later re-conversion would load it — with the OLD membership — the
-    /// moment mongod runs with `--replSet` again. The documented way back to
-    /// a clean standalone is to drop the `local` database; this does exactly
-    /// that, and only when such a config exists. Returns whether it did.
+    /// member still carries that set's config in `local.system.replset` — a
+    /// later re-conversion would load it, with the OLD membership, the moment
+    /// mongod runs with `--replSet` again — and the change-stream pre-images
+    /// collection `config.system.preimages`, which every replica set creates.
+    /// The documented way back to a clean standalone is to drop the `local`
+    /// database; this does that, and drops the pre-images collection with
+    /// it: pre-images are unusable without a replica set (no change streams
+    /// on a standalone), the set re-creates the collection, and one left
+    /// behind makes the next `--replSet` boot after an UNCLEAN standalone
+    /// stop segfault in startup recovery (mongod 8.0 startup_recovery.cpp,
+    /// `recoverChangeStreamCollections` skips the oplog-less case only for a
+    /// standalone; `cleanupPreImagesCollectionAfterUncleanShutdown` then
+    /// reads the earliest oplog timestamp through a null oplog pointer once
+    /// `local` is gone — and every retry of that boot is unclean again).
+    /// Runs only when either leftover exists. Returns whether anything was
+    /// dropped.
     ///
-    /// The `root` role carries no `dropDatabase` on `local` (its
-    /// dbAdminAnyDatabase excludes `local` and `config`; the first CI run
-    /// hit `Unauthorized` here), so the drop runs under a temporary
-    /// maintenance role: created, granted to this user, used from a fresh
-    /// connection, then revoked and dropped again — no artifact stays behind.
+    /// The `root` role carries no `dropDatabase` on `local` nor
+    /// `dropCollection` on `config` (its dbAdminAnyDatabase excludes `local`
+    /// and `config`; the first CI run hit `Unauthorized` here), so the drops
+    /// run under a temporary maintenance role: created, granted to this user,
+    /// used from a fresh connection, then revoked and dropped again — no
+    /// artifact stays behind.
     pub async fn drop_stale_replset_config(&self) -> Result<bool> {
         let count = tokio::time::timeout(
             SHORT_COMMAND_TIMEOUT,
-            self.client
-                .read()
+            self.pooled()
                 .await
-                .clone()
+                .0
                 .database("local")
                 .collection::<Document>("system.replset")
                 .count_documents(doc! {}),
@@ -407,7 +582,20 @@ impl Mongo {
         .await
         .map_err(|_| anyhow!("counting local.system.replset timed out"))?
         .context("counting local.system.replset failed")?;
-        if count == 0 {
+        let has_preimages = !tokio::time::timeout(
+            SHORT_COMMAND_TIMEOUT,
+            self.pooled()
+                .await
+                .0
+                .database("config")
+                .list_collection_names()
+                .filter(doc! { "name": PREIMAGES_COLLECTION }),
+        )
+        .await
+        .map_err(|_| anyhow!("listing the config database's collections timed out"))?
+        .context("listing the config database's collections failed")?
+        .is_empty();
+        if count == 0 && !has_preimages {
             return Ok(false);
         }
 
@@ -417,10 +605,16 @@ impl Mongo {
             .admin(
                 doc! {
                     "createRole": ROLE,
-                    "privileges": [ {
-                        "resource": { "db": "local", "collection": "" },
-                        "actions": [ "dropDatabase", "dropCollection" ],
-                    } ],
+                    "privileges": [
+                        {
+                            "resource": { "db": "local", "collection": "" },
+                            "actions": [ "dropDatabase", "dropCollection" ],
+                        },
+                        {
+                            "resource": { "db": "config", "collection": PREIMAGES_COLLECTION },
+                            "actions": [ "dropCollection" ],
+                        },
+                    ],
                     "roles": [],
                 },
                 SHORT_COMMAND_TIMEOUT,
@@ -445,10 +639,34 @@ impl Mongo {
         // the version of that guarantee this code does not have to trust).
         let password = self.password.read().await.clone();
         let fresh = client_for(&self.host, self.port, &self.username, &password, true);
-        let dropped = tokio::time::timeout(RECONFIG_TIMEOUT, fresh.database("local").drop())
+        let mut dropped = Ok(());
+        if count > 0 {
+            dropped = tokio::time::timeout(RECONFIG_TIMEOUT, fresh.database("local").drop())
+                .await
+                .map_err(|_| anyhow!("dropping the local database timed out"))
+                .and_then(|r| r.context("dropping the local database failed"));
+        }
+        if dropped.is_ok() && has_preimages {
+            dropped = tokio::time::timeout(
+                RECONFIG_TIMEOUT,
+                fresh
+                    .database("config")
+                    .collection::<Document>(PREIMAGES_COLLECTION)
+                    .drop(),
+            )
             .await
-            .map_err(|_| anyhow!("dropping the local database timed out"))
-            .and_then(|r| r.context("dropping the local database failed"));
+            .map_err(|_| anyhow!("dropping config.system.preimages timed out"))
+            .and_then(|r| match r {
+                Ok(()) => Ok(()),
+                // 26 NamespaceNotFound: gone between the listing and the drop.
+                Err(e) if matches!(e.kind.as_ref(), ErrorKind::Command(c) if c.code == 26) => {
+                    Ok(())
+                }
+                Err(e) => {
+                    Err(anyhow::Error::new(e).context("dropping config.system.preimages failed"))
+                }
+            });
+        }
         fresh.shutdown().await;
 
         // Best effort: the role's job is done either way, and a failure to
@@ -590,6 +808,7 @@ mod tests {
             state_str: String::new(),
             healthy,
             is_self,
+            optime_secs: None,
         }
     }
 
@@ -675,6 +894,82 @@ mod tests {
             split_host_port("[fd12::1]:27017"),
             ("fd12::1".into(), 27017)
         );
+    }
+
+    /// A driver error carrying a server command failure with `code`, the
+    /// shape `admin` sees (CommandError is non-exhaustive: built through its
+    /// Deserialize impl, wrapped the way `run_admin` wraps it).
+    fn server_error(code: i32, errmsg: &str) -> anyhow::Error {
+        let command: mongodb::error::CommandError = mongodb::bson::from_document(doc! {
+            "code": code, "codeName": "x", "errmsg": errmsg,
+        })
+        .unwrap();
+        anyhow::Error::new(mongodb::error::Error::from(ErrorKind::Command(command)))
+            .context("replSetGetStatus failed")
+    }
+
+    #[test]
+    fn a_lost_session_is_code_13_and_nothing_else() {
+        assert!(is_lost_session(&server_error(
+            13,
+            "Command replSetGetStatus requires authentication"
+        )));
+        assert!(!is_lost_session(&server_error(
+            94,
+            "no replset config has been received"
+        )));
+        assert!(!is_lost_session(&anyhow!(
+            "replSetGetStatus timed out after 2s"
+        )));
+        assert_eq!(
+            command_error_code(&server_error(13, "x")),
+            Some(codes::UNAUTHORIZED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_session_rebuilds_the_pool_once_per_generation() {
+        let m = Mongo::connect_local(27017, "mongo", "pw");
+        let (_, g0) = m.pooled().await;
+        assert_eq!(g0, 0);
+        // Two callers that observed the same logged-out generation: one
+        // rebuild, not two — the second finds the pool already past it.
+        m.reauthenticate(g0).await;
+        m.reauthenticate(g0).await;
+        assert_eq!(m.pooled().await.1, 1);
+        // A stale observation after the rebuild is a no-op too.
+        m.reauthenticate(g0).await;
+        assert_eq!(m.pooled().await.1, 1);
+        // A proven password swap is a new generation with the new identity.
+        m.swap_password("other").await;
+        assert_eq!(m.pooled().await.1, 2);
+        assert_eq!(*m.password.read().await, "other");
+    }
+
+    #[test]
+    fn member_from_doc_reads_optime_seconds_from_the_timestamp_not_the_date() {
+        let m = doc! {
+            "_id": 1i32,
+            "name": "mongo-2:27017",
+            "state": 2i32,
+            "stateStr": "SECONDARY",
+            "health": 1.0,
+            "optime": { "ts": Bson::Timestamp(mongodb::bson::Timestamp { time: 1_700_000_000, increment: 3 }) },
+        };
+        let member = member_from_doc(&m);
+        assert_eq!(member.host, "mongo-2:27017");
+        assert_eq!(member.state_str, "SECONDARY");
+        assert!(member.healthy);
+        assert_eq!(member.optime_secs, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn member_from_doc_tolerates_a_missing_optime() {
+        // A member just added has no optime yet — must not panic or fall
+        // back to a bogus zero that would read as "1970, wildly behind".
+        let m = doc! { "_id": 2i32, "name": "mongo-3:27017", "state": 6i32, "stateStr": "UNKNOWN" };
+        let member = member_from_doc(&m);
+        assert_eq!(member.optime_secs, None);
     }
 
     #[test]

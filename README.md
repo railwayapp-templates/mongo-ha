@@ -60,7 +60,9 @@ decisions:
   majority; 503 in every other case, including when the node cannot confirm
   its own status.
 - `GET /rs/state` — peer exchange (JSON): whether this node holds a set, its
-  primary, whether it holds user data. Consumed by peers' initiate guards.
+  primary, whether it holds user data, and this node's own current oplog
+  window (`oplog_window_seconds`, see Monitoring below). Consumed by peers'
+  initiate guards.
 - `POST /rs/keyfile` — the set's keyfile, to a caller that proves the root
   password (JSON `{username, password}`, verified against this node's mongod).
 - `POST /switchover` — ask THIS node to become the primary (Railway's
@@ -121,14 +123,85 @@ The `mongo-wrapper` binary (one per data node):
   is adopted live. A node with no pin that finds a live set adopts that set's
   keyfile from a peer over `POST /rs/keyfile`, which hands it out only
   against a root password the peer verifies on its own mongod.
+- **Pooled connection after initial sync.** The wrapper's admin connection
+  authenticates once per pooled socket. On a member that joined by initial
+  sync, the root user it logged in as is the one the entrypoint created on the
+  fresh volume; the sync replaces `admin` with the set's copy (a different
+  userId) and mongod logs the session out on the next user-cache refresh
+  (server log id 20245), after which every pooled command fails with code 13
+  "requires authentication" while fresh connections still work. The wrapper
+  treats that code as a lost session: it rebuilds the pool with the active
+  password (once per pool generation, however many callers saw the failure)
+  and retries the command once. Without it an initial-synced member's
+  `/rs/state` and `/role` stay 503 for the life of the process, so an
+  election that promotes it never reaches HAProxy.
 - **Standalone mode.** Without `RS_SEEDS` (or with `RS_ENABLED=false`, which
   the revert flow sets) mongod runs with no `--replSet`, exactly as the
-  upstream image would. A replica set config left in the `local` database by
-  a previous HA life is dropped — the documented way back to a standalone —
-  so a later re-conversion starts from a clean initiate.
+  upstream image would. A volume that ran as a replica set member (every HA
+  boot records it on the volume before mongod spawns; a volume from an older
+  image is recognised by the keyfile in its credential pin) first replays its
+  oplog: a member's
+  collections are not journaled — durability is the journaled oplog plus
+  stable checkpoints, replayed on every `--replSet` boot — and a boot without
+  `--replSet` performs no replay, so after a crash before the redeploy (or
+  with writes past the majority commit point after a clean stop) mongod drops
+  every collection created after the last checkpoint as an unknown ident.
+  The wrapper runs a loopback-only recovery mongod with
+  `recoverFromOplogAsStandalone=true` and `takeUnstableCheckpointOnShutdown=true`,
+  stops it cleanly so the replayed state is checkpointed, and only then starts
+  the standalone mongod; a recovery mongod that fails for any reason other
+  than "no oplog" stops the node (exit 78) with the fix in its log instead of
+  booting over the data. A replica set config left in the `local` database by
+  a previous HA life is then dropped — the documented way back to a
+  standalone — together with the change-stream pre-images collection
+  (`config.system.preimages`: unusable without a replica set, re-created by
+  the next set, and a `--replSet` boot after an unclean standalone stop
+  segfaults in startup recovery when it finds it without an oplog), so a
+  later re-conversion starts from a clean initiate.
 - **Volume runtime lock.** An exclusive `flock` at the data dir root for the
   supervisor's whole life, so an overlapping redeploy waits for the previous
   container instead of racing it on WiredTiger's own lock.
+
+## Monitoring / observability
+
+The `replication_monitor` module (`mongo-wrapper/src/replication_monitor.rs`)
+watches for the failure mode field data (Atlas's own oplog-window alert, a
+community-forum operator's 15+ hour stale-secondary incident) shows is the
+most common way a MongoDB replica set silently loses redundancy: a member
+whose replication has fallen behind far enough that it can no longer catch up
+incrementally and needs a full resync. **This is observation and reporting
+only — no self-heal, no auto-resync, no remediation** (see Status below).
+
+On the primary, every `member_duties` poll (the existing 3s supervisor
+cadence — no separate timer) samples:
+
+- **Replication lag vs the primary** — each member's last-applied optime
+  against the primary's, from the same `replSetGetStatus` view the
+  membership-prune round already reads.
+- **The oplog window** — the wall-clock span, oldest to newest entry, that
+  `local.oplog.rs` currently holds on the node being sampled (any node can
+  compute its own; the primary's is what a lagging secondary is actually
+  racing against, since it is the entries the primary has already overwritten
+  that make a secondary un-recoverable).
+- **Member state and how long it has been held** — `stateStr`
+  (RECOVERING/STARTUP2/...) plus a per-host dwell clock, so a member stuck for
+  20 minutes is distinguishable from a normal few-second transition (mongod's
+  own status never reports how long a state has been held; the wrapper tracks
+  it).
+
+A telemetry event (`mongo_ha.component_error`, the same `ComponentError`
+shape every other mongo-specific event already reports through) fires once
+per incident — not once per poll — when:
+
+| Signal | Threshold | Why |
+|---|---|---|
+| Member stuck in RECOVERING/STARTUP2 | `STUCK_STATE_DWELL` = 900s (15m) | Matches mysql-ha's own stuck-member dwell; comfortably above any transient transition, hours short of letting a real stale-secondary incident go unnoticed |
+| Lag eating the oplog window ("about to fall off / fallen off" — the condition that matters most) | lag ≥ 75% of the primary's oplog window (`LAG_VS_OPLOG_WINDOW_WARN_RATIO`) | Fires with lead time before the member is actually unable to catch up (100% of the window), rather than only after |
+| Oplog window itself shrinking | below `OPLOG_WINDOW_FLOOR` = 1h | Comfortably above every planned disruption the wrapper introduces (demote-on-shutdown, a supervised respawn, the initiate/join dwells), so it flags a shrinking oplog long before it becomes a real risk |
+
+This node's own oplog window is also exposed on `GET /rs/state` as
+`oplog_window_seconds` (additive/optional field; older peers mid-rollout
+ignore it).
 
 ## Environment contract
 
@@ -169,19 +242,27 @@ Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml
 ## Testing
 
 - `cargo test` — unit tests (initiate decision, config editing, keyfile,
-  HAProxy rendering).
+  HAProxy rendering, replication-monitor threshold derivation against
+  synthetic `replSetGetStatus` shapes: healthy, lagging-but-recoverable,
+  fallen-off-the-oplog, stuck-RECOVERING/STARTUP2).
 - `./test/e2e.sh` — docker-based end-to-end suite: set formation and
   replication, failover on primary pause, cold restart, switchover, demote
   on SIGTERM, wiped-volume rejoin, standalone-volume conversion, scale-up
   to 5, minority-partition write fence, paused-vs-deleted member pruning,
-  revert-and-reconvert, a root-password edit without rotation (pin keeps the
-  set together) plus a proper rotation (pin follows), a fresh member joining
+  revert-and-reconvert after a clean stop and after a SIGKILL (the crash
+  variant is the one a boot without the oplog replay fails: the canary's
+  collection is dropped as an unknown ident), a root-password edit without
+  rotation (pin keeps the set together) plus a proper rotation (pin follows),
+  a fresh member joining
   with a drifted RS_KEY, and the RS_KEY boot guard. Runs on every pull
   request.
 
 ## Status
 
 Functional: formation, failover, conversion of a standalone volume, scale
-up/down, partition fencing, switchover, revert. Scoped out of v1: a read port
-over the secondaries; self-heal of a member mongod reports as too stale to
-catch up (it stays RECOVERING for an operator); continuous backup / PITR.
+up/down, partition fencing, switchover, revert, oplog-window / stuck-member
+monitoring (telemetry only — see Monitoring above). Scoped out of v1: a read
+port over the secondaries; self-heal of a member mongod reports as too stale
+to catch up (it stays RECOVERING for an operator — the monitoring above
+reports this so an operator can act, but nothing in the wrapper acts on it
+automatically); continuous backup / PITR.

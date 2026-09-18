@@ -47,6 +47,14 @@ pub struct RsState {
     /// adopted data a joiner's initial-sync casualty.
     pub has_data: bool,
     pub config_version: Option<i64>,
+    /// This node's own oplog window right now — the wall-clock span, in
+    /// whole seconds, between the oldest and newest entries in its
+    /// `local.oplog.rs` (see `Mongo::oplog_window`). `None` when the oplog is
+    /// empty or unreadable, never a synthetic zero. `#[serde(default)]` so a
+    /// peer running an older wrapper (mid-rolling-deploy) still parses: this
+    /// field is additive, not part of the initiate-guard contract.
+    #[serde(default)]
+    pub oplog_window_seconds: Option<u64>,
 }
 
 /// One peer's answer, or why there isn't one. The distinction matters: an

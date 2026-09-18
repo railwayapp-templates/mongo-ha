@@ -51,7 +51,10 @@ pub struct AuthPin {
     /// The root password mongod actually enforces.
     pub password: String,
     /// The keyfile content every member of this node's set shares. None on a
-    /// volume that has only ever run standalone.
+    /// volume that has only ever run standalone, or that was reverted to
+    /// standalone: a standalone boot retires the pinned keyfile once its
+    /// password is proven (see `resolve_boot_credentials`), so a keyfile in
+    /// the pin always means "the last proven boot ran as a set member".
     #[serde(default)]
     pub keyfile: Option<String>,
 }
@@ -94,10 +97,17 @@ pub struct BootCredentials {
 /// Resolve the credentials for this boot.
 ///
 /// `pin` — what the volume remembers (None on a fresh volume or first HA
-/// boot). `env_password` / `env_rs_key` — the environment. `live_set_keyfile`
-/// — a keyfile fetched from a peer that already holds a set, when this node
-/// has no pin (see the module doc); ignored when a pin exists, because a
-/// pinned member IS one of the set's holders.
+/// boot). `env_password` / `env_rs_key` — the environment; `env_rs_key` is
+/// None on a standalone boot (no `--keyFile`), and a standalone boot resolves
+/// NO keyfile even from a pin: the pinned keyfile is a record of the volume's
+/// HA life, and the resolver writing this boot's credentials back retires it.
+/// That is what keeps the oplog replay of a revert (standalone_recovery.rs)
+/// to once per revert on a volume from an image without the boot marker, and
+/// on re-conversion the node resolves its keyfile like a fresh one — from the
+/// live set if a peer holds one, else from `RS_KEY`. `live_set_keyfile` — a
+/// keyfile fetched from a peer that already holds a set, when this node has
+/// no pinned keyfile (see the module doc); ignored when a pin carries one,
+/// because a pinned member IS one of the set's holders.
 pub fn resolve_boot_credentials(
     pin: Option<&AuthPin>,
     env_password: &str,
@@ -109,12 +119,17 @@ pub fn resolve_boot_credentials(
         Some(pin) => {
             // A pinned keyfile outranks the environment; a pin with no
             // keyfile (standalone history) resolves the keyfile like a fresh
-            // node would.
-            let keyfile = pin
-                .keyfile
-                .clone()
-                .or_else(|| live_set_keyfile.map(str::to_string))
-                .or_else(|| env_keyfile.clone());
+            // node would. A standalone boot (no RS_KEY) carries no keyfile at
+            // all, whatever the pin says: re-pinning without it is how the
+            // volume records that its set-member life is over.
+            let keyfile = if env_rs_key.is_none() {
+                None
+            } else {
+                pin.keyfile
+                    .clone()
+                    .or_else(|| live_set_keyfile.map(str::to_string))
+                    .or_else(|| env_keyfile.clone())
+            };
             let keyfile_drifted = matches!(
                 (&pin.keyfile, &env_keyfile),
                 (Some(pinned), Some(env)) if pinned != env
@@ -304,6 +319,37 @@ mod tests {
         assert!(!c.env_drifted);
         let c = resolve_boot_credentials(Some(&pin), "pw", Some("key"), Some("LIVE=="));
         assert_eq!(c.keyfile.as_deref(), Some("LIVE=="));
+    }
+
+    #[test]
+    fn a_standalone_boot_retires_the_pinned_keyfile() {
+        // A reverted member boots without RS_KEY. The password stays pinned;
+        // the keyfile is not carried into this boot's credentials, so the
+        // resolver's write-back leaves a pin without one — the once-per-revert
+        // latch for the oplog replay (standalone_recovery::replay_needed).
+        let member = AuthPin {
+            password: "pw".into(),
+            keyfile: Some(derive_keyfile_content("key")),
+        };
+        let c = resolve_boot_credentials(Some(&member), "pw", None, None);
+        assert_eq!(c.password, "pw");
+        assert_eq!(c.keyfile, None, "a standalone boot pins no keyfile");
+        assert!(!c.env_drifted, "retiring the keyfile is not drift");
+        // An edited password on the same standalone boot is still drift.
+        let drifted = resolve_boot_credentials(Some(&member), "new", None, None);
+        assert_eq!(drifted.password, "pw");
+        assert_eq!(drifted.keyfile, None);
+        assert!(drifted.env_drifted);
+        // The HA boot after that (a re-conversion) resolves like a fresh node.
+        let retired = AuthPin {
+            password: "pw".into(),
+            keyfile: None,
+        };
+        let reconverted = resolve_boot_credentials(Some(&retired), "pw", Some("key"), None);
+        assert_eq!(
+            reconverted.keyfile.as_deref(),
+            Some(derive_keyfile_content("key").as_str())
+        );
     }
 
     #[test]
