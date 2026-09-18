@@ -28,6 +28,7 @@
 
 mod auth_pin;
 mod config;
+mod credentials;
 mod demote_on_shutdown;
 mod dns_probe;
 mod health_auth;
@@ -53,7 +54,8 @@ async fn main() -> Result<()> {
     let _guard = init_logging("mongo-wrapper");
 
     let config = Arc::new(Config::from_env()?);
-    let telemetry = Arc::new(Telemetry::from_env("mongo-ha"));
+    let telemetry =
+        Arc::new(tokio::task::spawn_blocking(|| Telemetry::from_env("mongo-ha")).await?);
 
     // At most one container runs against this dataset at a time: wait for a
     // previous container's supervisor to release the volume before anything
@@ -98,6 +100,9 @@ async fn main() -> Result<()> {
     // Credentials for this boot: the volume's pin outranks the environment
     // (see auth_pin.rs). A node with no pin that finds a live set among its
     // peers adopts that set's keyfile instead of deriving its own.
+    if config.rs_enabled() {
+        credentials::reconcile_keyfile_at_boot(&config).await?;
+    }
     let pin = auth_pin::read_pin(&config.data_dir);
     if pin.is_none()
         && std::path::Path::new(&config.data_dir)
@@ -168,6 +173,7 @@ async fn main() -> Result<()> {
             .clone()
             .expect("HA mode always resolves a keyfile (RS_KEY is validated in Config::from_env)");
         keyfile::write_keyfile_content(&config.keyfile_path, &keyfile)?;
+        credentials::set_loaded_keyfile(keyfile.clone());
         // The wrapper's record that this data dir runs as a set member — what
         // a later standalone boot (a revert) keys its oplog replay on (see
         // standalone_recovery.rs). Before mongod spawns, so it is there
@@ -273,5 +279,5 @@ async fn main() -> Result<()> {
         deadline_ms: config.demote_timeout_ms,
     });
 
-    process_manager::supervise(child, demote).await
+    process_manager::supervise(child, demote, config, flags, args).await
 }

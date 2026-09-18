@@ -22,3 +22,5 @@ mongodb.workspace = true
 # secret into a string mongod accepts as keyfile content.
 sha2 = "0.10"
 base64 = "0.22"
+
+subtle = "2.6"

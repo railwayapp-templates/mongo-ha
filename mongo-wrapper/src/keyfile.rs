@@ -16,6 +16,8 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tracing::{info, warn};
@@ -45,9 +47,16 @@ pub fn write_keyfile_content(path: &str, content: &str) -> Result<()> {
         fs::create_dir_all(dir)
             .with_context(|| format!("could not create keyfile directory {}", dir.display()))?;
     }
-    fs::write(path, content)
-        .with_context(|| format!("could not write keyfile {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o400))
+    let tmp = path.with_extension("rotation.tmp");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o400))
         .with_context(|| format!("could not chmod keyfile {}", path.display()))?;
 
     // Ownership: the entrypoint re-execs as `mongodb` when started as root
@@ -56,7 +65,7 @@ pub fn write_keyfile_content(path: &str, content: &str) -> Result<()> {
     // leave ownership alone — mongod then reads it as whoever runs it.
     match nix::unistd::User::from_name(MONGOD_USER) {
         Ok(Some(user)) => {
-            if let Err(e) = nix::unistd::chown(path, Some(user.uid), Some(user.gid)) {
+            if let Err(e) = nix::unistd::chown(&tmp, Some(user.uid), Some(user.gid)) {
                 warn!(error = %format!("{e:#}"), user = MONGOD_USER, "could not chown the keyfile; mongod may refuse it");
             }
         }
@@ -69,6 +78,10 @@ pub fn write_keyfile_content(path: &str, content: &str) -> Result<()> {
         }
     }
 
+    fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
     info!(path = %path.display(), "keyfile written");
     Ok(())
 }
@@ -109,6 +122,11 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             derive_keyfile_content("secret")
+        );
+        write_keyfile(path.to_str().unwrap(), "rotated").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            derive_keyfile_content("rotated")
         );
         fs::remove_dir_all(&dir).ok();
     }

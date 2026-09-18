@@ -25,8 +25,8 @@
 //! - The resolver keeps probing the environment's password while it
 //!   disagrees with the pin. The moment it authenticates — the user rotated
 //!   the stored user properly, then updated the variable — the pin adopts it.
-//!   The keyfile pin never follows: rotating a keyfile is a coordinated,
-//!   set-wide operation this version does not perform.
+//!   The keyfile changes only through the coordinated two-pass rotation
+//!   protocol, or after proving a disjoint live peer key during recovery.
 //! - A node with no pin (fresh volume, first HA boot) that finds a live set
 //!   among its peers adopts THAT set's keyfile over `/rs/keyfile` (proving
 //!   the root password to the peer) instead of deriving its own — so a
@@ -73,8 +73,36 @@ pub fn read_pin(data_dir: &str) -> Option<AuthPin> {
 
 /// Persist the pin atomically (temp file + rename), owner-only readable from
 /// its first byte: the temp file is born 0600 (see open_private), the body is
-/// written and synced, then the file is renamed into place.
+/// written and synced, then the file is renamed into place. Serialized so a
+/// password reconciliation cannot clobber a concurrent keyfile pin write.
+static PIN_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn write_pin(data_dir: &str, pin: &AuthPin) -> Result<()> {
+    let _guard = PIN_WRITE.lock().unwrap();
+    write_pin_unlocked(data_dir, pin)
+}
+
+/// Password reconciliation must never overwrite a coordinated keyfile change
+/// with the credentials captured when this process booted.
+pub fn write_password_pin(
+    data_dir: &str,
+    password: &str,
+    fallback_key: Option<String>,
+) -> Result<()> {
+    let _guard = PIN_WRITE.lock().unwrap();
+    let keyfile = read_pin(data_dir)
+        .and_then(|pin| pin.keyfile)
+        .or(fallback_key);
+    write_pin_unlocked(
+        data_dir,
+        &AuthPin {
+            password: password.into(),
+            keyfile,
+        },
+    )
+}
+
+fn write_pin_unlocked(data_dir: &str, pin: &AuthPin) -> Result<()> {
     use std::io::Write;
 
     let path = pin_path(data_dir);
@@ -87,6 +115,7 @@ pub fn write_pin(data_dir: &str, pin: &AuthPin) -> Result<()> {
         .with_context(|| format!("syncing {}", tmp.display()))?;
     drop(file);
     fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
+    fs::File::open(data_dir)?.sync_all()?;
     Ok(())
 }
 
@@ -205,6 +234,18 @@ pub async fn resolver(
     let mut proven = false;
     let mut drift_reported = false;
     loop {
+        if let Some(pending) = crate::credentials::pending_password(&data_dir) {
+            if pending != active
+                && matches!(
+                    mongo.probe_local_password(&pending).await,
+                    PasswordProbe::Works
+                )
+            {
+                mongo.swap_password(&pending).await;
+                active = pending;
+                proven = false;
+            }
+        }
         if !proven {
             match mongo.probe_local_password(&active).await {
                 PasswordProbe::Works => {
@@ -214,7 +255,7 @@ pub async fn resolver(
                         keyfile: boot.keyfile.clone(),
                     };
                     if read_pin(&data_dir).as_ref() != Some(&pin) {
-                        match write_pin(&data_dir, &pin) {
+                        match write_password_pin(&data_dir, &pin.password, pin.keyfile) {
                             Ok(()) => info!("credential pin written"),
                             Err(e) => {
                                 error!(error = %format!("{e:#}"), "could not write the credential pin")
@@ -257,7 +298,7 @@ pub async fn resolver(
                         password: active.clone(),
                         keyfile: boot.keyfile.clone(),
                     };
-                    if let Err(e) = write_pin(&data_dir, &pin) {
+                    if let Err(e) = write_password_pin(&data_dir, &pin.password, pin.keyfile) {
                         error!(error = %format!("{e:#}"), "could not update the credential pin");
                     }
                 }
@@ -434,4 +475,11 @@ mod tests {
         assert_eq!(read_pin(d), Some(pin));
         fs::remove_dir_all(&dir).ok();
     }
+}
+
+/// Peer operations must use the same live credential as the local pool.
+pub fn active_password(config: &crate::config::Config) -> String {
+    read_pin(&config.data_dir)
+        .map(|p| p.password)
+        .unwrap_or_else(|| config.mongo_root_password.clone())
 }
