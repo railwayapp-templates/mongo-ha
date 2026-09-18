@@ -4,7 +4,8 @@
 //!   - Port 27017 (writes): HTTP health check on each node's /role endpoint.
 //!     Only the node that returns 200 (the current replica set PRIMARY) is
 //!     marked UP.
-//!   - Port 8404: stats page for observability.
+//!   - Port 8404: stats page for observability — open on loopback, HTTP Basic
+//!     for everyone else (see generate_stats_listener).
 //!
 //! The health check hits the Rust health server running on each
 //! mongo-wrapper container (HEALTH_CHECK_PORT, default 8080), not mongod
@@ -37,8 +38,47 @@ fn server_entries(nodes: &[MongoNode], health_port: u16, config: &Config) -> Str
         .join("\n")
 }
 
+/// The stats listener. Loopback clients (the in-container monitor and the
+/// healthcheck) are always allowed. Anyone else must present the stats
+/// credential; without a credential configured, remote access is denied.
+///
+/// The credential is read by haproxy from the environment at parse time
+/// (`"${HAPROXY_STATS_USER}"` / `"${HAPROXY_STATS_PASSWORD}"`, see main.rs)
+/// so the rendered config — which is logged at startup — never contains it.
+fn generate_stats_listener(config: &Config) -> String {
+    let (userlist, remote_rule) = if config.stats_auth.is_some() {
+        (
+            "userlist stats_users\n    user \"${HAPROXY_STATS_USER}\" insecure-password \"${HAPROXY_STATS_PASSWORD}\"\n\n",
+            "http-request auth unless { http_auth(stats_users) }",
+        )
+    } else {
+        ("", "http-request deny")
+    };
+    format!(
+        r#"{userlist}# Stats page for monitoring
+listen stats
+    bind :::8404 v4v6
+    mode http
+    acl LOCALHOST src 127.0.0.1 ::1 ::ffff:127.0.0.1
+    http-request allow if LOCALHOST
+    {remote_rule}
+    stats enable
+    stats uri /stats
+    stats refresh 10s
+    # This proxy's own traffic is not worth logging: the in-container
+    # monitoring loop scrapes /stats every few seconds and each scrape opens
+    # two connections. Carried over from redis-ha, where inheriting `log
+    # global` here made self-traffic ~99% of the service's entire log volume,
+    # burying the lines an operator actually needs (backend UP/DOWN, DNS
+    # re-resolution, client connects).
+    no log
+"#
+    )
+}
+
 pub fn generate_config(config: &Config, nodes: &[MongoNode]) -> String {
     let servers = server_entries(nodes, config.health_port, config);
+    let stats = generate_stats_listener(config);
 
     format!(
         r#"global
@@ -70,21 +110,7 @@ resolvers railway
     hold valid      10s
     hold obsolete   10s
 
-# Stats page for monitoring
-listen stats
-    bind :::8404 v4v6
-    mode http
-    stats enable
-    stats uri /stats
-    stats refresh 10s
-    # This proxy's own traffic is not worth logging: the in-container
-    # monitoring loop scrapes /stats every few seconds and each scrape opens
-    # two connections. Carried over from redis-ha, where inheriting `log
-    # global` here made self-traffic ~99% of the service's entire log volume,
-    # burying the lines an operator actually needs (backend UP/DOWN, DNS
-    # re-resolution, client connects).
-    no log
-
+{stats}
 # Write traffic — routed exclusively to the current replica set PRIMARY.
 # The /role health check returns 200 only on the primary node.
 frontend mongo_writes
@@ -114,6 +140,7 @@ backend mongo_primary_backend
         timeout_server = config.timeout_server,
         timeout_check = config.timeout_check,
         mongo_port = config.mongo_port,
+        stats = stats,
         servers = servers,
     )
 }
@@ -136,6 +163,17 @@ mod tests {
             check_interval: "3s".to_string(),
             check_fastinter: "500ms".to_string(),
             check_downinter: "500ms".to_string(),
+            stats_auth: None,
+        }
+    }
+
+    fn config_with_stats_auth() -> Config {
+        Config {
+            stats_auth: Some(crate::config::StatsAuth {
+                user: "mongo".into(),
+                password: "s3cret".into(),
+            }),
+            ..config_for_tests()
         }
     }
 
@@ -161,6 +199,53 @@ mod tests {
         let conf = generate_config(&config, &nodes);
 
         assert!(section(&conf, "listen stats").contains("no log"));
+    }
+
+    /// With a credential: loopback is allowed first, everyone else is asked
+    /// for HTTP Basic against the userlist, and the secret itself never lands
+    /// in the rendered (logged) config — haproxy expands it from its env.
+    #[test]
+    fn stats_page_requires_auth_for_remote_clients_when_credential_is_set() {
+        let config = config_with_stats_auth();
+        let nodes = crate::nodes::parse_nodes(&config.mongo_nodes).unwrap();
+        let conf = generate_config(&config, &nodes);
+
+        assert!(conf.contains(
+            "userlist stats_users\n    user \"${HAPROXY_STATS_USER}\" insecure-password \"${HAPROXY_STATS_PASSWORD}\""
+        ));
+        let stats = section(&conf, "listen stats");
+        assert!(stats.contains("acl LOCALHOST src 127.0.0.1 ::1 ::ffff:127.0.0.1"));
+        assert!(stats.contains(
+            "http-request allow if LOCALHOST\n    http-request auth unless { http_auth(stats_users) }\n    stats enable"
+        ));
+        assert!(!stats.contains("http-request deny"));
+        assert!(!conf.contains("s3cret"));
+        assert!(stats.contains("no log"));
+    }
+
+    /// Without a credential: loopback still allowed, everyone else denied.
+    #[test]
+    fn stats_page_denies_remote_clients_without_a_credential() {
+        let config = config_for_tests();
+        let nodes = crate::nodes::parse_nodes(&config.mongo_nodes).unwrap();
+        let conf = generate_config(&config, &nodes);
+
+        assert!(!conf.contains("userlist"));
+        let stats = section(&conf, "listen stats");
+        assert!(stats
+            .contains("http-request allow if LOCALHOST\n    http-request deny\n    stats enable"));
+        assert!(!stats.contains("http_auth"));
+    }
+
+    /// The listener keeps its bind, URI and refresh either way.
+    #[test]
+    fn stats_listener_keeps_its_bind_and_uri() {
+        for config in [config_for_tests(), config_with_stats_auth()] {
+            let nodes = crate::nodes::parse_nodes(&config.mongo_nodes).unwrap();
+            let conf = generate_config(&config, &nodes);
+            assert!(conf.contains("listen stats\n    bind :::8404 v4v6\n    mode http\n"));
+            assert!(conf.contains("stats uri /stats\n    stats refresh 10s\n"));
+        }
     }
 
     /// ...and silencing it must not silence the proxy that carries real
