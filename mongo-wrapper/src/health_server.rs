@@ -22,8 +22,12 @@
 //!                 other secondary, steps the current primary down with a
 //!                 catch-up window, and waits for this node to win the
 //!                 election; 200 means it did (which /role then reflects).
+//!                 The one mutating route: with HEALTH_API_PASSWORD set it
+//!                 requires HTTP Basic auth (401 otherwise), see
+//!                 health_auth.rs. The reads above never do.
 
 use crate::config::Config;
+use crate::health_auth::{self, Guard};
 use crate::mongo::{has_majority, probe_password, Mongo, PasswordProbe, RsStatus};
 use crate::rs::local_rs_state;
 use anyhow::Context;
@@ -280,14 +284,25 @@ async fn switchover(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
-async fn run_health_server(health_port: u16, state: Arc<AppState>) -> anyhow::Result<()> {
-    let app = Router::new()
+/// The open routes, with the mutating one merged in behind `guard`.
+fn router(state: Arc<AppState>, guard: Guard) -> Router {
+    let mutating =
+        health_auth::protect(Router::new().route("/switchover", post(switchover)), guard);
+    Router::new()
         .route("/health", get(health))
         .route("/role", get(role))
         .route("/rs/state", get(rs_state))
         .route("/rs/keyfile", post(rs_keyfile))
-        .route("/switchover", post(switchover))
-        .with_state(state);
+        .merge(mutating)
+        .with_state(state)
+}
+
+async fn run_health_server(
+    health_port: u16,
+    state: Arc<AppState>,
+    guard: Guard,
+) -> anyhow::Result<()> {
+    let app = router(state, guard);
 
     // Bind the IPv6 unspecified address rather than 0.0.0.0: Railway's private
     // network is IPv6 (fd12::... hostnames), and an IPv4-only listener refuses
@@ -321,15 +336,18 @@ const RESPAWN_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 pub async fn run_health_server_supervised(
     health_port: u16,
     state: Arc<AppState>,
+    guard: Guard,
     telemetry: Arc<Telemetry>,
 ) {
     let mut alerted_for_current_incident = false;
 
     loop {
         let attempt_state = state.clone();
+        let attempt_guard = guard.clone();
         let started_at = std::time::Instant::now();
-        let handle =
-            tokio::task::spawn(async move { run_health_server(health_port, attempt_state).await });
+        let handle = tokio::task::spawn(async move {
+            run_health_server(health_port, attempt_state, attempt_guard).await
+        });
         let outcome = handle.await;
         let ran_for = started_at.elapsed();
 
