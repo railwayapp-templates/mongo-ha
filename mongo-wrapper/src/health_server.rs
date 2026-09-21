@@ -169,7 +169,7 @@ async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         // of that.
         match state.mongo.rs_status().await? {
             RsStatus::Active { members, .. } => anyhow::Ok(has_majority(&members)),
-            RsStatus::NotInitialized => anyhow::Ok(false),
+            RsStatus::NotInitialized | RsStatus::NotAMember => anyhow::Ok(false),
         }
     }
     .await;
