@@ -111,7 +111,10 @@ pub async fn local_rs_state(mongo: &Mongo, config: &Config, has_data: bool) -> R
         .flatten()
         .map(|d| d.as_secs());
     Ok(match status {
-        RsStatus::NotInitialized => RsState {
+        // Both shapes mean "not part of a live set": no config at all, or a
+        // config that no longer lists us. Peers must still see `has_data` so a
+        // fresh node does not initiate over the dataset we are holding.
+        RsStatus::NotInitialized | RsStatus::NotAMember => RsState {
             node_id,
             set_active: false,
             set_name: None,
@@ -450,17 +453,33 @@ pub async fn orchestrate(
                 continue;
             }
         };
-        let removed =
-            matches!(status, RsStatus::Active { my_state, .. } if my_state == STATE_REMOVED);
-        if let RsStatus::Active { my_state_str, .. } = &status {
-            if !removed {
-                info!(state = %my_state_str, "member of the replica set");
-                break;
+        let removed = match &status {
+            RsStatus::NotInitialized => false,
+            // The node holds a config that does not list it — a peer
+            // reconfigured the set without it. mongod answers every
+            // replSetGetStatus with InvalidReplicaSetConfig from here on, so
+            // waiting it out never resolves: only a primary can re-add us.
+            RsStatus::NotAMember => {
+                if wait_log_once(&mut last_log, "not-a-member") {
+                    warn!("local config does not list this node; seeking to be re-added");
+                }
+                true
             }
-            if wait_log_once(&mut last_log, "removed") {
-                warn!("this node was removed from the set's config; seeking to be re-added");
+            RsStatus::Active {
+                my_state,
+                my_state_str,
+                ..
+            } => {
+                if *my_state != STATE_REMOVED {
+                    info!(state = %my_state_str, "member of the replica set");
+                    break;
+                }
+                if wait_log_once(&mut last_log, "removed") {
+                    warn!("this node was removed from the set's config; seeking to be re-added");
+                }
+                true
             }
-        }
+        };
 
         let answers = query_peers(&http, &config, &peer_hosts).await;
         let now = Instant::now();

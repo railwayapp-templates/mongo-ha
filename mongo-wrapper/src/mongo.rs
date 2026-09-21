@@ -49,6 +49,9 @@ const PREIMAGES_COLLECTION: &str = "system.preimages";
 pub mod codes {
     /// `replSetGetStatus`/`replSetGetConfig` on a member with no config yet.
     pub const NOT_YET_INITIALIZED: i32 = 94;
+    /// The node holds a config it is not a member of — a peer reconfigured the
+    /// set without it, so its local copy names hosts that do not include self.
+    pub const INVALID_REPLICA_SET_CONFIG: i32 = 93;
     /// `replSetInitiate` on a node that already holds a config.
     pub const ALREADY_INITIALIZED: i32 = 23;
     /// Reconfig against a stale config version, or an incompatible change.
@@ -128,6 +131,10 @@ fn member_from_doc(m: &Document) -> RsMember {
 #[derive(Debug, Clone)]
 pub enum RsStatus {
     NotInitialized,
+    /// The node holds a config that does not list it: a peer reconfigured the
+    /// set without it. Like `REMOVED`, only the peers' view counts now — the
+    /// node has to be re-added through the current primary.
+    NotAMember,
     Active {
         set_name: String,
         my_state: i32,
@@ -519,6 +526,9 @@ impl Mongo {
             }
             Err(e) if command_error_code(&e) == Some(codes::NOT_YET_INITIALIZED) => {
                 Ok(RsStatus::NotInitialized)
+            }
+            Err(e) if command_error_code(&e) == Some(codes::INVALID_REPLICA_SET_CONFIG) => {
+                Ok(RsStatus::NotAMember)
             }
             Err(e) => Err(e),
         }
