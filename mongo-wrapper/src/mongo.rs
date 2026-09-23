@@ -251,11 +251,19 @@ pub fn classify(e: &anyhow::Error) -> Failure {
 }
 
 /// When to rebuild the pooled client. Pure: the caller supplies `now`.
+///
+/// Backoff only throttles rebuilds that did not help: a rebuild arms a window
+/// for its own failure kind, and only a repeat of that kind before anything
+/// proves the rebuilt client works is held back. Any proof clears it, so the
+/// first auth failure after the credential last worked always rebuilds at
+/// once — including after a rebuild at boot, before the root user existed.
 #[derive(Debug)]
 struct RecoveryPolicy {
     transport_failures: u32,
     backoff: Duration,
-    next_allowed: Option<Instant>,
+    /// The failure kind the last rebuild was for, and when another rebuild
+    /// for that kind may happen. Cleared once the rebuilt client is proven.
+    pending: Option<(Failure, Instant)>,
 }
 
 impl RecoveryPolicy {
@@ -263,25 +271,37 @@ impl RecoveryPolicy {
         Self {
             transport_failures: 0,
             backoff: REBUILD_BACKOFF_MIN,
-            next_allowed: None,
+            pending: None,
         }
     }
 
-    /// `authenticated`: the command needed an authenticated session, so its
-    /// success proves the credential works (`hello`/`ping` do not).
-    fn on_success(&mut self, authenticated: bool) {
+    fn proven(&mut self, authenticated: bool) {
         self.transport_failures = 0;
-        if authenticated {
-            self.backoff = REBUILD_BACKOFF_MIN;
-            self.next_allowed = None;
+        match self.pending {
+            // Any answer proves the transport; only an authenticated one
+            // proves the credential.
+            Some((Failure::Transport, _)) => self.pending = None,
+            Some(_) if authenticated => self.pending = None,
+            _ => {}
         }
+        if self.pending.is_none() {
+            self.backoff = REBUILD_BACKOFF_MIN;
+        }
+    }
+
+    /// `authenticated`: the command needed an authenticated session
+    /// (`hello`/`ping` do not), so a server answer to it proves the
+    /// credential works.
+    fn on_success(&mut self, authenticated: bool) {
+        self.proven(authenticated);
     }
 
     /// Whether this failure should rebuild the client now.
-    fn on_failure(&mut self, failure: Failure, now: Instant) -> bool {
+    fn on_failure(&mut self, failure: Failure, authenticated: bool, now: Instant) -> bool {
         match failure {
             Failure::Verdict => {
-                self.transport_failures = 0;
+                // The server answered: the client works.
+                self.proven(authenticated);
                 return false;
             }
             Failure::Transport => {
@@ -292,11 +312,15 @@ impl RecoveryPolicy {
             }
             Failure::Auth => {}
         }
-        if self.next_allowed.is_some_and(|t| now < t) {
-            return false;
+        match self.pending {
+            Some((kind, until)) if kind == failure && now < until => return false,
+            // The previous rebuild for this kind did not fix it.
+            Some((kind, _)) if kind == failure => {
+                self.backoff = (self.backoff * 2).min(REBUILD_BACKOFF_MAX);
+            }
+            _ => self.backoff = REBUILD_BACKOFF_MIN,
         }
-        self.next_allowed = Some(now + self.backoff);
-        self.backoff = (self.backoff * 2).min(REBUILD_BACKOFF_MAX);
+        self.pending = Some((failure, now + self.backoff));
         self.transport_failures = 0;
         true
     }
@@ -567,10 +591,10 @@ impl Mongo {
         }
     }
 
-    fn note_failure(&self, failure: Failure) -> bool {
+    fn note_failure(&self, failure: Failure, authenticated: bool) -> bool {
         self.recovery
             .lock()
-            .map(|mut policy| policy.on_failure(failure, Instant::now()))
+            .map(|mut policy| policy.on_failure(failure, authenticated, Instant::now()))
             .unwrap_or(false)
     }
 
@@ -592,7 +616,7 @@ impl Mongo {
             Err(e) => e,
         };
         let failure = classify(&error);
-        if !self.note_failure(failure) {
+        if !self.note_failure(failure, authenticated) {
             return Err(error);
         }
         self.rebuild(generation, failure, &error).await;
@@ -606,7 +630,7 @@ impl Mongo {
                 Ok(v)
             }
             Err(e) => {
-                self.note_failure(classify(&e));
+                self.note_failure(classify(&e), authenticated);
                 Err(e)
             }
         }
@@ -1273,29 +1297,73 @@ mod tests {
     }
 
     #[test]
-    fn an_auth_failure_rebuilds_at_once_then_backs_off_until_auth_works() {
+    fn an_auth_failure_rebuilds_at_once_then_backs_off_while_rebuilds_do_not_help() {
         let mut p = RecoveryPolicy::new();
         let t0 = Instant::now();
         // First refusal: rebuild immediately (a lost session heals at once).
-        assert!(p.on_failure(Failure::Auth, t0));
-        // Still refused: no rebuild per request inside the backoff window.
-        assert!(!p.on_failure(Failure::Auth, t0 + Duration::from_secs(1)));
-        // `hello` succeeding proves nothing about the credential.
+        assert!(p.on_failure(Failure::Auth, true, t0));
+        // Refused again on the rebuilt client: held back, not per request.
+        assert!(!p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(1)));
+        // `hello` answering proves nothing about the credential.
         p.on_success(false);
-        assert!(!p.on_failure(Failure::Auth, t0 + Duration::from_secs(2)));
+        assert!(!p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(2)));
         // Window over: one more rebuild, and the next window is longer.
-        assert!(p.on_failure(Failure::Auth, t0 + REBUILD_BACKOFF_MIN));
+        assert!(p.on_failure(Failure::Auth, true, t0 + REBUILD_BACKOFF_MIN));
         assert!(!p.on_failure(
             Failure::Auth,
+            true,
             t0 + REBUILD_BACKOFF_MIN + REBUILD_BACKOFF_MIN
         ));
         assert!(p.on_failure(
             Failure::Auth,
+            true,
             t0 + REBUILD_BACKOFF_MIN + REBUILD_BACKOFF_MIN * 2
         ));
         // An authenticated success resets it: the next refusal rebuilds at once.
         p.on_success(true);
-        assert!(p.on_failure(Failure::Auth, t0 + Duration::from_secs(1000)));
+        assert!(p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(1000)));
+        assert_eq!(p.backoff, REBUILD_BACKOFF_MIN);
+    }
+
+    /// Boot: the wrapper polls `hello` before the root user exists, which
+    /// fails authentication and rebuilds. Until the node joins a set its
+    /// authenticated commands answer NotYetInitialized — a server verdict,
+    /// which proves the credential. The lost session right after initial
+    /// sync must then rebuild at once, not wait out the boot rebuild's window.
+    #[test]
+    fn a_lost_session_after_the_credential_worked_rebuilds_even_with_a_boot_rebuild_armed() {
+        let mut p = RecoveryPolicy::new();
+        let t0 = Instant::now();
+        assert!(p.on_failure(Failure::Auth, false, t0));
+        assert!(!p.on_failure(Failure::Verdict, true, t0 + Duration::from_secs(5)));
+        assert!(p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(10)));
+        // Same with a plain authenticated success in between.
+        let mut p = RecoveryPolicy::new();
+        assert!(p.on_failure(Failure::Auth, false, t0));
+        p.on_success(true);
+        assert!(p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(1)));
+    }
+
+    /// A verdict on `hello`/`ping` does not prove the credential.
+    #[test]
+    fn an_unauthenticated_verdict_does_not_clear_an_auth_rebuild() {
+        let mut p = RecoveryPolicy::new();
+        let t0 = Instant::now();
+        assert!(p.on_failure(Failure::Auth, true, t0));
+        assert!(!p.on_failure(Failure::Verdict, false, t0 + Duration::from_secs(1)));
+        assert!(!p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(2)));
+    }
+
+    /// A transport rebuild never holds back an auth rebuild, and vice versa.
+    #[test]
+    fn rebuild_windows_are_per_failure_kind() {
+        let mut p = RecoveryPolicy::new();
+        let t0 = Instant::now();
+        for _ in 1..TRANSPORT_FAILURES_BEFORE_REBUILD {
+            assert!(!p.on_failure(Failure::Transport, true, t0));
+        }
+        assert!(p.on_failure(Failure::Transport, true, t0));
+        assert!(p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(1)));
     }
 
     #[test]
@@ -1303,7 +1371,7 @@ mod tests {
         let mut p = RecoveryPolicy::new();
         let mut t = Instant::now();
         for _ in 0..20 {
-            assert!(p.on_failure(Failure::Auth, t));
+            assert!(p.on_failure(Failure::Auth, true, t));
             t += REBUILD_BACKOFF_MAX;
         }
         assert_eq!(p.backoff, REBUILD_BACKOFF_MAX);
@@ -1314,23 +1382,23 @@ mod tests {
         let mut p = RecoveryPolicy::new();
         let t0 = Instant::now();
         for _ in 1..TRANSPORT_FAILURES_BEFORE_REBUILD {
-            assert!(!p.on_failure(Failure::Transport, t0));
+            assert!(!p.on_failure(Failure::Transport, true, t0));
         }
-        assert!(p.on_failure(Failure::Transport, t0));
+        assert!(p.on_failure(Failure::Transport, true, t0));
         // A server verdict breaks the run and never rebuilds.
         let mut p = RecoveryPolicy::new();
         for _ in 1..TRANSPORT_FAILURES_BEFORE_REBUILD {
-            assert!(!p.on_failure(Failure::Transport, t0));
+            assert!(!p.on_failure(Failure::Transport, true, t0));
         }
-        assert!(!p.on_failure(Failure::Verdict, t0));
-        assert!(!p.on_failure(Failure::Transport, t0));
+        assert!(!p.on_failure(Failure::Verdict, true, t0));
+        assert!(!p.on_failure(Failure::Transport, true, t0));
         // So does any success, authenticated or not.
         let mut p = RecoveryPolicy::new();
         for _ in 1..TRANSPORT_FAILURES_BEFORE_REBUILD {
-            assert!(!p.on_failure(Failure::Transport, t0));
+            assert!(!p.on_failure(Failure::Transport, true, t0));
         }
         p.on_success(false);
-        assert!(!p.on_failure(Failure::Transport, t0));
+        assert!(!p.on_failure(Failure::Transport, true, t0));
     }
 
     #[test]
