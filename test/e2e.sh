@@ -356,6 +356,14 @@ t_set_forms_and_replicates() {
   else
     ok "secondary refuses direct writes"
   fi
+
+  # A young set's oplog holds seconds of history and nothing has been
+  # truncated from it: neither oplog alarm may fire.
+  if node_logged mongo-1 'oplog-window-low' || node_logged mongo-1 'replication-lag-vs-oplog-window'; then
+    bad "replication monitor alarmed on a young oplog"
+  else
+    ok "no oplog alarm on a young set"
+  fi
 }
 
 ensure_edge_image() {
@@ -437,6 +445,15 @@ t_failover_on_primary_pause() {
     ok "write accepted by new primary"
   else
     bad "new primary refused a write"
+  fi
+
+  # The paused ex-primary is unreachable from here on: mongod reports a
+  # placeholder optime for it, which is not replication lag.
+  sleep 7
+  if node_logged "$new_primary" 'replication-lag-vs-oplog-window'; then
+    bad "unreachable ex-primary reported as lagging"
+  else
+    ok "unreachable ex-primary not reported as lagging"
   fi
 
   # Bring the old primary back the way Railway would: the container restarts

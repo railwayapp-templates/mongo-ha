@@ -647,6 +647,14 @@ async fn member_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemet
                     _ => {}
                 }
                 last_role = Some(role);
+                if !h.is_writable_primary {
+                    // `hello` answers without authentication, so it cannot
+                    // notice a pooled client that lost its login. One
+                    // authenticated read per tick lets the client recover
+                    // here, before this node is elected and its /role
+                    // matters (the primary's rounds below read it already).
+                    let _ = mongo.rs_status().await;
+                }
                 if h.is_writable_primary {
                     prune_round(&config, &mongo, &telemetry, &mut gone, gone_dwell).await;
                     replication_health_round(
@@ -755,6 +763,15 @@ async fn replication_health_round(
             None
         }
     };
+    // Unknown fill reads as not size-bounded: the oplog signals stay quiet
+    // rather than fire on a window that may only measure the oplog's age.
+    let oplog_size_bounded = match mongo.oplog_fill().await {
+        Ok(fill) => fill.is_some_and(|f| f >= replication_monitor::OPLOG_SIZE_BOUNDED_FILL),
+        Err(e) => {
+            debug!(error = %format!("{e:#}"), "could not read this node's oplog fill");
+            false
+        }
+    };
 
     let now = Instant::now();
     let hosts: Vec<String> = members.iter().map(|m| m.host.clone()).collect();
@@ -765,6 +782,7 @@ async fn replication_health_round(
             state_str: m.state_str.clone(),
             optime_secs: m.optime_secs,
             is_self: m.is_self,
+            healthy: m.healthy,
             dwell: member_states.observe(&m.host, &m.state_str, now),
         })
         .collect();
@@ -775,8 +793,12 @@ async fn replication_health_round(
         .find(|m| m.state == states::PRIMARY)
         .and_then(|m| m.optime_secs);
 
-    let signals =
-        replication_monitor::derive_signals(oplog_window, primary_optime_secs, &observations);
+    let signals = replication_monitor::derive_signals(
+        oplog_window,
+        oplog_size_bounded,
+        primary_optime_secs,
+        &observations,
+    );
 
     let mut still_active = HashSet::with_capacity(signals.len());
     for signal in &signals {
