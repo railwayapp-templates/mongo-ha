@@ -43,8 +43,8 @@ use axum::{
 use common::{Telemetry, TelemetryEvent};
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
@@ -149,6 +149,47 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 }
 
+/// How often a /role that keeps failing is logged again.
+const ROLE_FAILURE_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// Rate limit for /role failure logs: the first failure, then once per
+/// `ROLE_FAILURE_LOG_EVERY` while it lasts, then one line on recovery.
+#[derive(Debug)]
+struct FailureLog {
+    failing_since: Option<Instant>,
+    last_logged: Option<Instant>,
+}
+
+impl FailureLog {
+    const fn new() -> Self {
+        Self {
+            failing_since: None,
+            last_logged: None,
+        }
+    }
+
+    /// Some(how long it has been failing) when this failure should be logged.
+    fn on_failure(&mut self, now: Instant) -> Option<Duration> {
+        let since = *self.failing_since.get_or_insert(now);
+        if self
+            .last_logged
+            .is_some_and(|t| now.duration_since(t) < ROLE_FAILURE_LOG_EVERY)
+        {
+            return None;
+        }
+        self.last_logged = Some(now);
+        Some(now.duration_since(since))
+    }
+
+    /// Some(how long it failed) on the first success after failures.
+    fn on_success(&mut self, now: Instant) -> Option<Duration> {
+        self.last_logged = None;
+        self.failing_since.take().map(|t| now.duration_since(t))
+    }
+}
+
+static ROLE_FAILURES: Mutex<FailureLog> = Mutex::new(FailureLog::new());
+
 async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.standalone {
         // No set to fence against — alive means writable.
@@ -173,6 +214,35 @@ async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         }
     }
     .await;
+
+    let now = Instant::now();
+    match &verdict {
+        Err(e) => {
+            if let Some(failing_for) = ROLE_FAILURES
+                .lock()
+                .ok()
+                .and_then(|mut l| l.on_failure(now))
+            {
+                warn!(
+                    error = %format!("{e:#}"),
+                    failing_for_secs = failing_for.as_secs(),
+                    "/role cannot read the replica set state; answering 503"
+                );
+            }
+        }
+        Ok(_) => {
+            if let Some(failed_for) = ROLE_FAILURES
+                .lock()
+                .ok()
+                .and_then(|mut l| l.on_success(now))
+            {
+                info!(
+                    failed_for_secs = failed_for.as_secs(),
+                    "/role reads the replica set state again"
+                );
+            }
+        }
+    }
 
     match verdict {
         Ok(true) => (StatusCode::OK, "primary"),
@@ -439,6 +509,33 @@ pub async fn run_health_server_supervised(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn role_failures_log_first_then_once_a_minute_then_on_recovery() {
+        let mut log = super::FailureLog::new();
+        let t0 = std::time::Instant::now();
+        assert_eq!(log.on_failure(t0), Some(std::time::Duration::ZERO));
+        assert_eq!(
+            log.on_failure(t0 + std::time::Duration::from_secs(30)),
+            None
+        );
+        assert_eq!(
+            log.on_failure(t0 + std::time::Duration::from_secs(61)),
+            Some(std::time::Duration::from_secs(61))
+        );
+        assert_eq!(
+            log.on_success(t0 + std::time::Duration::from_secs(70)),
+            Some(std::time::Duration::from_secs(70))
+        );
+        // Healthy again: nothing to report, and the next failure logs at once.
+        assert_eq!(
+            log.on_success(t0 + std::time::Duration::from_secs(71)),
+            None
+        );
+        assert!(log
+            .on_failure(t0 + std::time::Duration::from_secs(72))
+            .is_some());
+    }
+
     use super::*;
     use tokio::net::TcpListener;
 

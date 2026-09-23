@@ -24,6 +24,20 @@
 //! never on 13. So `admin` treats a code 13 as a lost session: it rebuilds the
 //! pool with the active password, once per observed pool generation, and
 //! retries the command once.
+//!
+//! ## Recovering the pooled client in general
+//!
+//! A lost session is one way the pooled client can stop working while mongod
+//! is fine; a refused authentication (code 18, or the driver's own
+//! authentication failure on a fresh socket) and a client that keeps timing
+//! out are others. Every command on the pooled client goes through
+//! `recovering`, which classifies a failure (`classify`) and lets
+//! `RecoveryPolicy` decide whether to rebuild: an authentication failure
+//! rebuilds at once, a run of transport failures (timeouts, server
+//! selection, I/O) rebuilds after `TRANSPORT_FAILURES_BEFORE_REBUILD`, and a
+//! server verdict never does. Rebuilds back off exponentially until an
+//! authenticated command succeeds again, so a credential that stays refused
+//! costs one rebuild per backoff window, not one per request.
 
 use anyhow::{anyhow, bail, Context, Result};
 use mongodb::bson::{doc, Bson, Document};
@@ -32,14 +46,23 @@ use mongodb::options::{
     ClientOptions, Credential, ReadPreference, SelectionCriteria, ServerAddress,
 };
 use mongodb::Client;
-use std::sync::Arc;
-use std::time::Duration;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::warn;
 
 const SHORT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 /// A reconfig may wait for the previous config to commit across a majority.
 const RECONFIG_TIMEOUT: Duration = Duration::from_secs(30);
+/// First wait after a rebuild before another may happen; doubles per rebuild
+/// up to `REBUILD_BACKOFF_MAX`, and resets once an authenticated command
+/// succeeds.
+const REBUILD_BACKOFF_MIN: Duration = Duration::from_secs(30);
+const REBUILD_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Consecutive transport failures (timeouts, server selection, I/O) on the
+/// pooled client before it is rebuilt.
+const TRANSPORT_FAILURES_BEFORE_REBUILD: u32 = 5;
 /// The change-stream pre-images collection every replica set creates in
 /// `config`; dropped with `local` on a revert (see drop_stale_replset_config).
 const PREIMAGES_COLLECTION: &str = "system.preimages";
@@ -66,6 +89,8 @@ pub mod codes {
     /// On a pool that authenticated at connection time this means mongod
     /// logged the session out underneath the driver — see the module doc.
     pub const UNAUTHORIZED: i32 = 13;
+    /// The server refused the credential outright.
+    pub const AUTHENTICATION_FAILED: i32 = 18;
 }
 
 /// What `hello` said about the server behind this connection.
@@ -119,12 +144,28 @@ fn member_from_doc(m: &Document) -> RsMember {
         healthy: m.get_f64("health").map(|h| h >= 1.0).unwrap_or(false)
             || bson_int(m.get("health")).map(|h| h >= 1).unwrap_or(false),
         is_self: m.get_bool("self").unwrap_or(false),
+        // mongod reports `Timestamp(0, 0)` for a member it has no optime for
+        // (DOWN, STARTUP, unreachable); that is an absent optime, not 1970.
         optime_secs: m
             .get_document("optime")
             .ok()
             .and_then(|d| d.get_timestamp("ts").ok())
-            .map(|ts| ts.time),
+            .map(|ts| ts.time)
+            .filter(|&secs| secs > 0),
     }
+}
+
+/// `size / maxSize` from a `collStats` reply on the oplog. Both are byte
+/// counts mongod may encode as int, long or double.
+fn oplog_fill_from_stats(stats: &Document) -> Option<f64> {
+    let number = |key: &str| match stats.get(key) {
+        Some(Bson::Int32(n)) => Some(f64::from(*n)),
+        Some(Bson::Int64(n)) => Some(*n as f64),
+        Some(Bson::Double(n)) => Some(*n),
+        _ => None,
+    };
+    let (size, max) = (number("size")?, number("maxSize")?);
+    (max > 0.0).then(|| size / max)
 }
 
 /// The node's replica set status, or the fact that it has none.
@@ -162,6 +203,134 @@ struct Pool {
     generation: u64,
 }
 
+/// A bounded operation that ran out of time. Typed so `classify` can tell a
+/// stuck client apart from a server verdict.
+#[derive(Debug)]
+pub struct TimedOut(pub String);
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
+/// What a failed command on the pooled client says about the client itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// The connection is not (or no longer) authenticated.
+    Auth,
+    /// The command never got a server answer: timeout, server selection, I/O.
+    Transport,
+    /// The server answered with a verdict; the client works.
+    Verdict,
+}
+
+pub fn classify(e: &anyhow::Error) -> Failure {
+    if e.downcast_ref::<TimedOut>().is_some() {
+        return Failure::Transport;
+    }
+    match e
+        .downcast_ref::<mongodb::error::Error>()
+        .map(|e| e.kind.as_ref())
+    {
+        Some(ErrorKind::Authentication { .. }) => Failure::Auth,
+        Some(ErrorKind::Command(c))
+            if c.code == codes::UNAUTHORIZED || c.code == codes::AUTHENTICATION_FAILED =>
+        {
+            Failure::Auth
+        }
+        Some(
+            ErrorKind::ServerSelection { .. }
+            | ErrorKind::Io(_)
+            | ErrorKind::ConnectionPoolCleared { .. },
+        ) => Failure::Transport,
+        _ => Failure::Verdict,
+    }
+}
+
+/// When to rebuild the pooled client. Pure: the caller supplies `now`.
+///
+/// Backoff only throttles rebuilds that did not help: a rebuild arms a window
+/// for its own failure kind, and only a repeat of that kind before anything
+/// proves the rebuilt client works is held back. Any proof clears it, so the
+/// first auth failure after the credential last worked always rebuilds at
+/// once — including after a rebuild at boot, before the root user existed.
+#[derive(Debug)]
+struct RecoveryPolicy {
+    transport_failures: u32,
+    backoff: Duration,
+    /// The failure kind the last rebuild was for, and when another rebuild
+    /// for that kind may happen. Cleared once the rebuilt client is proven.
+    pending: Option<(Failure, Instant)>,
+}
+
+impl RecoveryPolicy {
+    const fn new() -> Self {
+        Self {
+            transport_failures: 0,
+            backoff: REBUILD_BACKOFF_MIN,
+            pending: None,
+        }
+    }
+
+    fn proven(&mut self, authenticated: bool) {
+        self.transport_failures = 0;
+        match self.pending {
+            // Any answer proves the transport; only an authenticated one
+            // proves the credential.
+            Some((Failure::Transport, _)) => self.pending = None,
+            Some(_) if authenticated => self.pending = None,
+            _ => {}
+        }
+        if self.pending.is_none() {
+            self.backoff = REBUILD_BACKOFF_MIN;
+        }
+    }
+
+    /// `authenticated`: the command needed an authenticated session
+    /// (`hello`/`ping` do not), so a server answer to it proves the
+    /// credential works.
+    fn on_success(&mut self, authenticated: bool) {
+        self.proven(authenticated);
+    }
+
+    /// Whether this failure should rebuild the client now.
+    fn on_failure(&mut self, failure: Failure, authenticated: bool, now: Instant) -> bool {
+        match failure {
+            Failure::Verdict => {
+                // The server answered: the client works.
+                self.proven(authenticated);
+                return false;
+            }
+            Failure::Transport => {
+                self.transport_failures += 1;
+                if self.transport_failures < TRANSPORT_FAILURES_BEFORE_REBUILD {
+                    return false;
+                }
+            }
+            Failure::Auth => {}
+        }
+        match self.pending {
+            Some((kind, until)) if kind == failure && now < until => return false,
+            // The previous rebuild for this kind did not fix it.
+            Some((kind, _)) if kind == failure => {
+                self.backoff = (self.backoff * 2).min(REBUILD_BACKOFF_MAX);
+            }
+            _ => self.backoff = REBUILD_BACKOFF_MIN,
+        }
+        self.pending = Some((failure, now + self.backoff));
+        self.transport_failures = 0;
+        true
+    }
+}
+
+/// Commands mongod answers without an authenticated session.
+fn needs_auth(name: &str) -> bool {
+    !matches!(name, "hello" | "ping" | "isMaster" | "ismaster")
+}
+
 #[derive(Clone)]
 pub struct Mongo {
     host: String,
@@ -177,6 +346,7 @@ pub struct Mongo {
     /// rebuilt when mongod logs its session out (see the module doc). Every
     /// clone of this handle observes the swap.
     pool: Arc<RwLock<Pool>>,
+    recovery: Arc<Mutex<RecoveryPolicy>>,
 }
 
 /// The budget of one credential probe against a mongod. Also the floor a
@@ -295,13 +465,6 @@ pub fn command_error_code(e: &anyhow::Error) -> Option<i32> {
         })
 }
 
-/// A reply saying the connection is not authenticated (code 13). Code 13 also
-/// covers a genuine privilege refusal; that one survives the single retry a
-/// rebuilt pool gets and is returned as is.
-pub fn is_lost_session(e: &anyhow::Error) -> bool {
-    command_error_code(e) == Some(codes::UNAUTHORIZED)
-}
-
 /// One admin command on a given client, bounded by `timeout`.
 async fn run_admin(
     client: &Client,
@@ -311,7 +474,7 @@ async fn run_admin(
 ) -> Result<Document> {
     tokio::time::timeout(timeout, client.database("admin").run_command(command))
         .await
-        .map_err(|_| anyhow!("{name} timed out after {timeout:?}"))?
+        .map_err(|_| anyhow::Error::new(TimedOut(format!("{name} timed out after {timeout:?}"))))?
         .map_err(|e| anyhow::Error::new(e).context(format!("{name} failed")))
 }
 
@@ -372,6 +535,7 @@ impl Mongo {
                 client: client_for("127.0.0.1", port, username, password, true),
                 generation: 0,
             })),
+            recovery: Arc::new(Mutex::new(RecoveryPolicy::new())),
         }
     }
 
@@ -395,11 +559,12 @@ impl Mongo {
         (pool.client.clone(), pool.generation)
     }
 
-    /// Rebuild the pool after a command on generation `observed` came back
-    /// Unauthorized (see the module doc). A caller that lost the race — the
-    /// pool is already past that generation — does nothing and retries on
-    /// the pool it finds.
-    async fn reauthenticate(&self, observed: u64) {
+    /// Rebuild the pool after a command on generation `observed` failed in a
+    /// way that implicates the client (see the module doc). A caller that
+    /// lost the race — the pool is already past that generation — does
+    /// nothing and retries on the pool it finds. The old client is shut down
+    /// in the background so a caller never waits on its in-flight work.
+    async fn rebuild(&self, observed: u64, failure: Failure, error: &anyhow::Error) {
         let old = {
             let mut pool = self.pool.write().await;
             if pool.generation != observed {
@@ -411,11 +576,64 @@ impl Mongo {
             warn!(
                 host = %self.host,
                 generation = pool.generation,
-                "mongod dropped the pooled connection's authenticated session (code 13); rebuilt the pool with the active password"
+                ?failure,
+                error = %format!("{error:#}"),
+                "pooled mongod client stopped working; rebuilt the pool with the active password"
             );
             std::mem::replace(&mut pool.client, fresh)
         };
-        old.shutdown().await;
+        tokio::spawn(async move { old.shutdown().await });
+    }
+
+    fn note_success(&self, authenticated: bool) {
+        if let Ok(mut policy) = self.recovery.lock() {
+            policy.on_success(authenticated);
+        }
+    }
+
+    fn note_failure(&self, failure: Failure, authenticated: bool) -> bool {
+        self.recovery
+            .lock()
+            .map(|mut policy| policy.on_failure(failure, authenticated, Instant::now()))
+            .unwrap_or(false)
+    }
+
+    /// Run `op` on the pooled client, recovering the client when a failure
+    /// implicates it (see the module doc). An authentication failure is
+    /// retried once on the rebuilt client: one that survives a fresh
+    /// authentication is a real verdict and is returned as is.
+    async fn recovering<T, F, Fut>(&self, authenticated: bool, op: F) -> Result<T>
+    where
+        F: Fn(Client) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let (client, generation) = self.pooled().await;
+        let error = match op(client).await {
+            Ok(v) => {
+                self.note_success(authenticated);
+                return Ok(v);
+            }
+            Err(e) => e,
+        };
+        let failure = classify(&error);
+        if !self.note_failure(failure, authenticated) {
+            return Err(error);
+        }
+        self.rebuild(generation, failure, &error).await;
+        if failure != Failure::Auth {
+            return Err(error);
+        }
+        let (client, _) = self.pooled().await;
+        match op(client).await {
+            Ok(v) => {
+                self.note_success(authenticated);
+                Ok(v)
+            }
+            Err(e) => {
+                self.note_failure(classify(&e), authenticated);
+                Err(e)
+            }
+        }
     }
 
     /// Probe this handle's own server with a candidate password.
@@ -436,6 +654,7 @@ impl Mongo {
             port,
             username: username.to_string(),
             password: Arc::new(RwLock::new(password.to_string())),
+            recovery: Arc::new(Mutex::new(RecoveryPolicy::new())),
         }
     }
 
@@ -462,19 +681,12 @@ impl Mongo {
                 }
             }
         }
-        let (client, generation) = self.pooled().await;
-        match run_admin(&client, command.clone(), timeout, &name).await {
-            Err(e) if is_lost_session(&e) => {
-                // mongod logged this pooled connection out (see the module
-                // doc); a fresh pool authenticates again with the active
-                // password. Retried once: a code 13 that survives a fresh
-                // authentication is a real authorization verdict.
-                self.reauthenticate(generation).await;
-                let (client, _) = self.pooled().await;
-                run_admin(&client, command, timeout, &name).await
-            }
-            outcome => outcome,
-        }
+        self.recovering(needs_auth(&name), |client| {
+            let command = command.clone();
+            let name = name.clone();
+            async move { run_admin(&client, command, timeout, &name).await }
+        })
+        .await
     }
 
     pub async fn ping(&self) -> Result<()> {
@@ -560,37 +772,67 @@ impl Mongo {
     /// `local.oplog.rs` specifically (backups need it), so no extra
     /// privilege is required here.
     pub async fn oplog_window(&self) -> Result<Option<Duration>> {
-        let client = self.pooled().await.0;
-        let oplog = client.database("local").collection::<Document>("oplog.rs");
-        let first = tokio::time::timeout(
-            SHORT_COMMAND_TIMEOUT,
-            oplog.find_one(doc! {}).sort(doc! { "$natural": 1 }),
-        )
+        self.recovering(true, |client| async move {
+            let oplog = client.database("local").collection::<Document>("oplog.rs");
+            let first = tokio::time::timeout(
+                SHORT_COMMAND_TIMEOUT,
+                oplog.find_one(doc! {}).sort(doc! { "$natural": 1 }),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(TimedOut("reading the oldest oplog entry timed out".into()))
+            })?
+            .context("reading the oldest oplog entry failed")?;
+            let Some(first) = first else {
+                return Ok(None);
+            };
+            let last = tokio::time::timeout(
+                SHORT_COMMAND_TIMEOUT,
+                oplog.find_one(doc! {}).sort(doc! { "$natural": -1 }),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::Error::new(TimedOut("reading the newest oplog entry timed out".into()))
+            })?
+            .context("reading the newest oplog entry failed")?;
+            let Some(last) = last else {
+                return Ok(None);
+            };
+            let (Some(first_ts), Some(last_ts)) = (
+                first.get_timestamp("ts").ok(),
+                last.get_timestamp("ts").ok(),
+            ) else {
+                return Ok(None);
+            };
+            Ok(Some(Duration::from_secs(
+                last_ts.time.saturating_sub(first_ts.time) as u64,
+            )))
+        })
         .await
-        .map_err(|_| anyhow!("reading the oldest oplog entry timed out"))?
-        .context("reading the oldest oplog entry failed")?;
-        let Some(first) = first else {
-            return Ok(None);
-        };
-        let last = tokio::time::timeout(
-            SHORT_COMMAND_TIMEOUT,
-            oplog.find_one(doc! {}).sort(doc! { "$natural": -1 }),
-        )
-        .await
-        .map_err(|_| anyhow!("reading the newest oplog entry timed out"))?
-        .context("reading the newest oplog entry failed")?;
-        let Some(last) = last else {
-            return Ok(None);
-        };
-        let (Some(first_ts), Some(last_ts)) = (
-            first.get_timestamp("ts").ok(),
-            last.get_timestamp("ts").ok(),
-        ) else {
-            return Ok(None);
-        };
-        Ok(Some(Duration::from_secs(
-            last_ts.time.saturating_sub(first_ts.time) as u64,
-        )))
+    }
+
+    /// How full this node's oplog is: its current size over its configured
+    /// maximum (`collStats` on `local.oplog.rs`). mongod truncates the oplog
+    /// only past that maximum, so until it is close to full no entry has
+    /// been dropped and the window is just the oplog's age. `None` when the
+    /// server reports no usable sizes.
+    pub async fn oplog_fill(&self) -> Result<Option<f64>> {
+        let stats = self
+            .recovering(true, |client| async move {
+                tokio::time::timeout(
+                    SHORT_COMMAND_TIMEOUT,
+                    client
+                        .database("local")
+                        .run_command(doc! { "collStats": "oplog.rs" }),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::Error::new(TimedOut("collStats on the oplog timed out".into()))
+                })?
+                .context("collStats on the oplog failed")
+            })
+            .await?;
+        Ok(oplog_fill_from_stats(&stats))
     }
 
     /// Initiate a brand-new single-member set with this node as member 0.
@@ -664,31 +906,41 @@ impl Mongo {
     /// used from a fresh connection, then revoked and dropped again — no
     /// artifact stays behind.
     pub async fn drop_stale_replset_config(&self) -> Result<bool> {
-        let count = tokio::time::timeout(
-            SHORT_COMMAND_TIMEOUT,
-            self.pooled()
+        let count = self
+            .recovering(true, |client| async move {
+                tokio::time::timeout(
+                    SHORT_COMMAND_TIMEOUT,
+                    client
+                        .database("local")
+                        .collection::<Document>("system.replset")
+                        .count_documents(doc! {}),
+                )
                 .await
-                .0
-                .database("local")
-                .collection::<Document>("system.replset")
-                .count_documents(doc! {}),
-        )
-        .await
-        .map_err(|_| anyhow!("counting local.system.replset timed out"))?
-        .context("counting local.system.replset failed")?;
-        let has_preimages = !tokio::time::timeout(
-            SHORT_COMMAND_TIMEOUT,
-            self.pooled()
+                .map_err(|_| {
+                    anyhow::Error::new(TimedOut("counting local.system.replset timed out".into()))
+                })?
+                .context("counting local.system.replset failed")
+            })
+            .await?;
+        let has_preimages = !self
+            .recovering(true, |client| async move {
+                tokio::time::timeout(
+                    SHORT_COMMAND_TIMEOUT,
+                    client
+                        .database("config")
+                        .list_collection_names()
+                        .filter(doc! { "name": PREIMAGES_COLLECTION }),
+                )
                 .await
-                .0
-                .database("config")
-                .list_collection_names()
-                .filter(doc! { "name": PREIMAGES_COLLECTION }),
-        )
-        .await
-        .map_err(|_| anyhow!("listing the config database's collections timed out"))?
-        .context("listing the config database's collections failed")?
-        .is_empty();
+                .map_err(|_| {
+                    anyhow::Error::new(TimedOut(
+                        "listing the config database's collections timed out".into(),
+                    ))
+                })?
+                .context("listing the config database's collections failed")
+            })
+            .await?
+            .is_empty();
         if count == 0 && !has_preimages {
             return Ok(false);
         }
@@ -1002,37 +1254,191 @@ mod tests {
             .context("replSetGetStatus failed")
     }
 
+    fn driver_error(kind: ErrorKind) -> anyhow::Error {
+        anyhow::Error::new(mongodb::error::Error::from(kind)).context("hello failed")
+    }
+
     #[test]
-    fn a_lost_session_is_code_13_and_nothing_else() {
-        assert!(is_lost_session(&server_error(
-            13,
-            "Command replSetGetStatus requires authentication"
-        )));
-        assert!(!is_lost_session(&server_error(
-            94,
-            "no replset config has been received"
-        )));
-        assert!(!is_lost_session(&anyhow!(
-            "replSetGetStatus timed out after 2s"
-        )));
+    fn classify_separates_auth_transport_and_verdicts() {
+        // Lost session (code 13) and a refused credential (code 18): auth.
+        assert_eq!(
+            classify(&server_error(
+                13,
+                "Command replSetGetStatus requires authentication"
+            )),
+            Failure::Auth
+        );
+        assert_eq!(
+            classify(&server_error(18, "Authentication failed.")),
+            Failure::Auth
+        );
+        // No server answer at all: transport.
+        assert_eq!(
+            classify(&anyhow::Error::new(TimedOut(
+                "replSetGetStatus timed out after 2s".into()
+            ))),
+            Failure::Transport
+        );
+        assert_eq!(
+            classify(&driver_error(ErrorKind::Io(Arc::new(
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset)
+            )))),
+            Failure::Transport
+        );
+        // The server answered: the client works.
+        assert_eq!(
+            classify(&server_error(94, "no replset config has been received")),
+            Failure::Verdict
+        );
         assert_eq!(
             command_error_code(&server_error(13, "x")),
             Some(codes::UNAUTHORIZED)
         );
     }
 
+    #[test]
+    fn an_auth_failure_rebuilds_at_once_then_backs_off_while_rebuilds_do_not_help() {
+        let mut p = RecoveryPolicy::new();
+        let t0 = Instant::now();
+        // First refusal: rebuild immediately (a lost session heals at once).
+        assert!(p.on_failure(Failure::Auth, true, t0));
+        // Refused again on the rebuilt client: held back, not per request.
+        assert!(!p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(1)));
+        // `hello` answering proves nothing about the credential.
+        p.on_success(false);
+        assert!(!p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(2)));
+        // Window over: one more rebuild, and the next window is longer.
+        assert!(p.on_failure(Failure::Auth, true, t0 + REBUILD_BACKOFF_MIN));
+        assert!(!p.on_failure(
+            Failure::Auth,
+            true,
+            t0 + REBUILD_BACKOFF_MIN + REBUILD_BACKOFF_MIN
+        ));
+        assert!(p.on_failure(
+            Failure::Auth,
+            true,
+            t0 + REBUILD_BACKOFF_MIN + REBUILD_BACKOFF_MIN * 2
+        ));
+        // An authenticated success resets it: the next refusal rebuilds at once.
+        p.on_success(true);
+        assert!(p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(1000)));
+        assert_eq!(p.backoff, REBUILD_BACKOFF_MIN);
+    }
+
+    /// Boot: the wrapper polls `hello` before the root user exists, which
+    /// fails authentication and rebuilds. Until the node joins a set its
+    /// authenticated commands answer NotYetInitialized — a server verdict,
+    /// which proves the credential. The lost session right after initial
+    /// sync must then rebuild at once, not wait out the boot rebuild's window.
+    #[test]
+    fn a_lost_session_after_the_credential_worked_rebuilds_even_with_a_boot_rebuild_armed() {
+        let mut p = RecoveryPolicy::new();
+        let t0 = Instant::now();
+        assert!(p.on_failure(Failure::Auth, false, t0));
+        assert!(!p.on_failure(Failure::Verdict, true, t0 + Duration::from_secs(5)));
+        assert!(p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(10)));
+        // Same with a plain authenticated success in between.
+        let mut p = RecoveryPolicy::new();
+        assert!(p.on_failure(Failure::Auth, false, t0));
+        p.on_success(true);
+        assert!(p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(1)));
+    }
+
+    /// A verdict on `hello`/`ping` does not prove the credential.
+    #[test]
+    fn an_unauthenticated_verdict_does_not_clear_an_auth_rebuild() {
+        let mut p = RecoveryPolicy::new();
+        let t0 = Instant::now();
+        assert!(p.on_failure(Failure::Auth, true, t0));
+        assert!(!p.on_failure(Failure::Verdict, false, t0 + Duration::from_secs(1)));
+        assert!(!p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(2)));
+    }
+
+    /// A transport rebuild never holds back an auth rebuild, and vice versa.
+    #[test]
+    fn rebuild_windows_are_per_failure_kind() {
+        let mut p = RecoveryPolicy::new();
+        let t0 = Instant::now();
+        for _ in 1..TRANSPORT_FAILURES_BEFORE_REBUILD {
+            assert!(!p.on_failure(Failure::Transport, true, t0));
+        }
+        assert!(p.on_failure(Failure::Transport, true, t0));
+        assert!(p.on_failure(Failure::Auth, true, t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn the_backoff_stops_growing_at_its_cap() {
+        let mut p = RecoveryPolicy::new();
+        let mut t = Instant::now();
+        for _ in 0..20 {
+            assert!(p.on_failure(Failure::Auth, true, t));
+            t += REBUILD_BACKOFF_MAX;
+        }
+        assert_eq!(p.backoff, REBUILD_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn transport_failures_rebuild_only_after_a_run_and_verdicts_never() {
+        let mut p = RecoveryPolicy::new();
+        let t0 = Instant::now();
+        for _ in 1..TRANSPORT_FAILURES_BEFORE_REBUILD {
+            assert!(!p.on_failure(Failure::Transport, true, t0));
+        }
+        assert!(p.on_failure(Failure::Transport, true, t0));
+        // A server verdict breaks the run and never rebuilds.
+        let mut p = RecoveryPolicy::new();
+        for _ in 1..TRANSPORT_FAILURES_BEFORE_REBUILD {
+            assert!(!p.on_failure(Failure::Transport, true, t0));
+        }
+        assert!(!p.on_failure(Failure::Verdict, true, t0));
+        assert!(!p.on_failure(Failure::Transport, true, t0));
+        // So does any success, authenticated or not.
+        let mut p = RecoveryPolicy::new();
+        for _ in 1..TRANSPORT_FAILURES_BEFORE_REBUILD {
+            assert!(!p.on_failure(Failure::Transport, true, t0));
+        }
+        p.on_success(false);
+        assert!(!p.on_failure(Failure::Transport, true, t0));
+    }
+
+    #[test]
+    fn only_hello_and_ping_count_as_unauthenticated() {
+        assert!(!needs_auth("hello"));
+        assert!(!needs_auth("ping"));
+        assert!(needs_auth("replSetGetStatus"));
+        assert!(needs_auth("replSetGetConfig"));
+    }
+
+    #[test]
+    fn oplog_fill_reads_size_over_max_in_any_numeric_encoding() {
+        assert_eq!(
+            oplog_fill_from_stats(&doc! { "size": 50i32, "maxSize": 100i64 }),
+            Some(0.5)
+        );
+        assert_eq!(
+            oplog_fill_from_stats(&doc! { "size": 99.0, "maxSize": 100.0 }),
+            Some(0.99)
+        );
+        assert_eq!(oplog_fill_from_stats(&doc! { "size": 1i64 }), None);
+        assert_eq!(
+            oplog_fill_from_stats(&doc! { "size": 1i64, "maxSize": 0i64 }),
+            None
+        );
+    }
+
     #[tokio::test]
-    async fn a_lost_session_rebuilds_the_pool_once_per_generation() {
+    async fn a_rebuild_happens_once_per_generation() {
         let m = Mongo::connect_local(27017, "mongo", "pw");
         let (_, g0) = m.pooled().await;
         assert_eq!(g0, 0);
-        // Two callers that observed the same logged-out generation: one
+        let err = server_error(13, "requires authentication");
+        // Two callers that observed the same failing generation: one
         // rebuild, not two — the second finds the pool already past it.
-        m.reauthenticate(g0).await;
-        m.reauthenticate(g0).await;
+        m.rebuild(g0, Failure::Auth, &err).await;
+        m.rebuild(g0, Failure::Auth, &err).await;
         assert_eq!(m.pooled().await.1, 1);
         // A stale observation after the rebuild is a no-op too.
-        m.reauthenticate(g0).await;
+        m.rebuild(g0, Failure::Auth, &err).await;
         assert_eq!(m.pooled().await.1, 1);
         // A proven password swap is a new generation with the new identity.
         m.swap_password("other").await;
@@ -1055,6 +1461,20 @@ mod tests {
         assert_eq!(member.state_str, "SECONDARY");
         assert!(member.healthy);
         assert_eq!(member.optime_secs, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn member_from_doc_reads_a_zero_optime_as_absent() {
+        // What mongod reports for a member it cannot reach.
+        let m = doc! {
+            "_id": 1i32,
+            "name": "mongo-2:27017",
+            "state": 8i32,
+            "stateStr": "(not reachable/healthy)",
+            "health": 0.0,
+            "optime": { "ts": Bson::Timestamp(mongodb::bson::Timestamp { time: 0, increment: 0 }), "t": -1i64 },
+        };
+        assert_eq!(member_from_doc(&m).optime_secs, None);
     }
 
     #[test]

@@ -73,6 +73,12 @@ pub const OPLOG_WINDOW_FLOOR: Duration = Duration::from_secs(3600);
 /// as the one that matters most.
 pub const LAG_VS_OPLOG_WINDOW_WARN_RATIO: f64 = 0.75;
 
+/// The oplog fill (size over its configured maximum) from which its window is
+/// bounded by size. mongod drops entries only past the maximum; below it the
+/// window is just the oplog's age — a young set reads a window of seconds
+/// with nothing truncated, and no member can have fallen off it.
+pub const OPLOG_SIZE_BOUNDED_FILL: f64 = 0.9;
+
 /// How long each member has continuously reported its CURRENT `stateStr` —
 /// reset the moment the reported state changes. `replSetGetStatus` reports
 /// only the state, never how long a member has held it, so "RECOVERING for
@@ -132,6 +138,8 @@ pub struct MemberObservation {
     /// has not applied anything yet (freshly added, still in initial sync).
     pub optime_secs: Option<u32>,
     pub is_self: bool,
+    /// The primary's heartbeat reaches this member (`health: 1`).
+    pub healthy: bool,
     pub dwell: Duration,
 }
 
@@ -230,12 +238,18 @@ impl ReplicationSignal {
 /// resolved), which thresholds does this poll cross. No I/O, no clock reads
 /// — `now`/dwell are resolved by the caller so this stays a plain function
 /// of its inputs, the same discipline `rs::decide` already follows.
+///
+/// `oplog_size_bounded`: the oplog is full enough that mongod truncates it
+/// (see `OPLOG_SIZE_BOUNDED_FILL`). Both oplog signals need it — before that
+/// the window measures age, not retention.
 pub fn derive_signals(
     oplog_window: Option<Duration>,
+    oplog_size_bounded: bool,
     primary_optime_secs: Option<u32>,
     members: &[MemberObservation],
 ) -> Vec<ReplicationSignal> {
     let mut signals = Vec::new();
+    let oplog_window = oplog_window.filter(|_| oplog_size_bounded);
 
     if let Some(window) = oplog_window {
         if window < OPLOG_WINDOW_FLOOR {
@@ -260,9 +274,15 @@ pub fn derive_signals(
             });
         }
 
-        if let (Some(window), Some(primary_secs), Some(member_secs)) =
-            (oplog_window, primary_optime_secs, m.optime_secs)
-        {
+        // Lag means something only for a reachable SECONDARY: any other
+        // state reports a stale or placeholder optime.
+        let replicating = m.healthy && m.state_str == "SECONDARY";
+        if let (true, Some(window), Some(primary_secs), Some(member_secs)) = (
+            replicating,
+            oplog_window,
+            primary_optime_secs,
+            m.optime_secs,
+        ) {
             if member_secs < primary_secs {
                 let lag = Duration::from_secs((primary_secs - member_secs) as u64);
                 let warn_at = window.mul_f64(LAG_VS_OPLOG_WINDOW_WARN_RATIO);
@@ -296,6 +316,7 @@ mod tests {
             state_str: state_str.to_string(),
             optime_secs,
             is_self,
+            healthy: true,
             dwell,
         }
     }
@@ -323,7 +344,7 @@ mod tests {
                 Duration::from_secs(120),
             ),
         ];
-        let signals = derive_signals(Some(WINDOW), Some(1000), &members);
+        let signals = derive_signals(Some(WINDOW), true, Some(1000), &members);
         assert!(signals.is_empty(), "{signals:?}");
     }
 
@@ -348,7 +369,7 @@ mod tests {
                 Duration::from_secs(30),
             ),
         ];
-        let signals = derive_signals(Some(WINDOW), Some(10_000), &members);
+        let signals = derive_signals(Some(WINDOW), true, Some(10_000), &members);
         assert!(signals.is_empty(), "{signals:?}");
     }
 
@@ -374,7 +395,7 @@ mod tests {
                 Duration::from_secs(30),
             ),
         ];
-        let signals = derive_signals(Some(WINDOW), Some(10_000), &members);
+        let signals = derive_signals(Some(WINDOW), true, Some(10_000), &members);
         assert_eq!(
             signals,
             vec![ReplicationSignal::FallingOffOplog {
@@ -405,7 +426,7 @@ mod tests {
                 Duration::from_secs(30),
             ),
         ];
-        let signals = derive_signals(Some(WINDOW), Some(10_000), &members);
+        let signals = derive_signals(Some(WINDOW), true, Some(10_000), &members);
         assert!(matches!(
             signals.as_slice(),
             [ReplicationSignal::FallingOffOplog { .. }]
@@ -432,7 +453,7 @@ mod tests {
                 STUCK_STATE_DWELL + Duration::from_secs(1),
             ),
         ];
-        let signals = derive_signals(Some(WINDOW), Some(10_000), &members);
+        let signals = derive_signals(Some(WINDOW), true, Some(10_000), &members);
         assert_eq!(
             signals,
             vec![ReplicationSignal::StuckInState {
@@ -453,7 +474,7 @@ mod tests {
             false,
             STUCK_STATE_DWELL,
         )];
-        let signals = derive_signals(Some(WINDOW), None, &members);
+        let signals = derive_signals(Some(WINDOW), true, None, &members);
         assert_eq!(
             signals,
             vec![ReplicationSignal::StuckInState {
@@ -476,7 +497,7 @@ mod tests {
             false,
             Duration::from_secs(5),
         )];
-        let signals = derive_signals(Some(WINDOW), None, &members);
+        let signals = derive_signals(Some(WINDOW), true, None, &members);
         assert!(signals.is_empty(), "{signals:?}");
     }
 
@@ -491,7 +512,7 @@ mod tests {
             true,
             STUCK_STATE_DWELL * 2,
         )];
-        let signals = derive_signals(Some(WINDOW), Some(10_000), &members);
+        let signals = derive_signals(Some(WINDOW), true, Some(10_000), &members);
         assert!(signals.is_empty(), "{signals:?}");
     }
 
@@ -507,7 +528,7 @@ mod tests {
             true,
             Duration::ZERO,
         )];
-        let signals = derive_signals(Some(small_window), Some(10_000), &members);
+        let signals = derive_signals(Some(small_window), true, Some(10_000), &members);
         assert_eq!(
             signals,
             vec![ReplicationSignal::OplogWindowLow {
@@ -527,7 +548,7 @@ mod tests {
             true,
             Duration::ZERO,
         )];
-        let signals = derive_signals(Some(OPLOG_WINDOW_FLOOR), Some(10_000), &members);
+        let signals = derive_signals(Some(OPLOG_WINDOW_FLOOR), true, Some(10_000), &members);
         assert!(signals.is_empty(), "{signals:?}");
     }
 
@@ -544,7 +565,7 @@ mod tests {
             false,
             Duration::from_secs(30),
         )];
-        let signals = derive_signals(None, Some(1_000_000), &members);
+        let signals = derive_signals(None, true, Some(1_000_000), &members);
         assert!(signals.is_empty(), "{signals:?}");
     }
 
@@ -632,5 +653,99 @@ mod tests {
             tracker.observe("mongo-2", RECOVERING, t0 + Duration::from_secs(1000)),
             Duration::ZERO
         );
+    }
+    /// A young oplog is far below its maximum: its window is the oplog's
+    /// age, nothing has been truncated, and no member can have fallen off —
+    /// neither oplog signal fires, however small the window or large the lag.
+    #[test]
+    fn a_young_oplog_raises_no_oplog_signal() {
+        let members = vec![
+            member(
+                "mongo-1:27017",
+                "PRIMARY",
+                Some(10_000),
+                true,
+                Duration::ZERO,
+            ),
+            member(
+                "mongo-2:27017",
+                "SECONDARY",
+                Some(9_997),
+                false,
+                Duration::from_secs(3),
+            ),
+        ];
+        let signals = derive_signals(Some(Duration::from_secs(3)), false, Some(10_000), &members);
+        assert!(signals.is_empty(), "{signals:?}");
+    }
+
+    /// Once the oplog is size-bounded the same small window does fire.
+    #[test]
+    fn a_size_bounded_small_window_still_fires() {
+        let members = vec![member(
+            "mongo-1:27017",
+            "PRIMARY",
+            Some(10_000),
+            true,
+            Duration::ZERO,
+        )];
+        let signals = derive_signals(Some(Duration::from_secs(3)), true, Some(10_000), &members);
+        assert_eq!(
+            signals,
+            vec![ReplicationSignal::OplogWindowLow {
+                oplog_window: Duration::from_secs(3)
+            }]
+        );
+    }
+
+    /// An unreachable member keeps the last optime it was seen with (or a
+    /// placeholder); its distance from the primary is not replication lag.
+    #[test]
+    fn an_unreachable_member_is_never_reported_as_lagging() {
+        let mut down = member(
+            "mongo-2:27017",
+            "(not reachable/healthy)",
+            Some(10_000 - WINDOW.as_secs() as u32),
+            false,
+            Duration::from_secs(30),
+        );
+        down.healthy = false;
+        let members = vec![
+            member(
+                "mongo-1:27017",
+                "PRIMARY",
+                Some(10_000),
+                true,
+                Duration::ZERO,
+            ),
+            down,
+        ];
+        let signals = derive_signals(Some(WINDOW), true, Some(10_000), &members);
+        assert!(signals.is_empty(), "{signals:?}");
+    }
+
+    /// A SECONDARY the primary cannot currently reach is not measured either.
+    #[test]
+    fn an_unhealthy_secondary_is_not_measured() {
+        let mut secondary = member(
+            "mongo-2:27017",
+            "SECONDARY",
+            Some(10_000 - WINDOW.as_secs() as u32),
+            false,
+            Duration::from_secs(30),
+        );
+        secondary.healthy = false;
+        let members = vec![
+            member(
+                "mongo-1:27017",
+                "PRIMARY",
+                Some(10_000),
+                true,
+                Duration::ZERO,
+            ),
+            secondary,
+        ];
+        let signals = derive_signals(Some(WINDOW), true, Some(10_000), &members);
+        assert!(signals.is_empty(), "{signals:?}");
     }
 }
