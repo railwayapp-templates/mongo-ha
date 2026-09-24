@@ -12,7 +12,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 MONGO_VERSION="${MONGO_VERSION:-8.0}"
-IMAGE="mongo-ha-e2e:${MONGO_VERSION}"
+IMAGE="${MONGO_HA_E2E_IMAGE:-mongo-ha-e2e:${MONGO_VERSION}}"
 NET="mongo-ha-e2e-net"
 LABEL="mongo-ha-e2e=1"
 ROOT_USER="mongo"
@@ -1171,11 +1171,54 @@ t_missing_rs_key_refuses_boot() {
   docker rm -f mongo-nokey >/dev/null
 }
 
+# A cold dataset must not be opened before its restored private name points
+# at the returning container. Docker names deliberately differ from RS hosts
+# until the aliases are registered, reproducing restore-time DNS publication.
+t_cold_restart_waits_for_own_dns() {
+  log "t_cold_restart_waits_for_own_dns"
+  ensure_trio
+  wait_until 300 "initial set" set_is_fully_online mongo-1 || { bad "initial set never formed"; return; }
+  mongo mongo-1 'db.getSiblingDB("t").kv.insertOne({_id:"dns-restore",v:"preserved"},{writeConcern:{w:"majority",j:true}})' >/dev/null
+  local before n
+  before="$(mongo mongo-1 'print(rs.conf().settings.replicaSetId.toString())' | tail -1)"
+  docker stop mongo-1 mongo-2 mongo-3 >/dev/null
+  docker rm mongo-1 mongo-2 mongo-3 >/dev/null
+  for n in 1 2 3; do
+    docker run -d --label "$LABEL" --name "returning-$n" --hostname "returning-$n" \
+      --network "$NET" -v "mongo-ha-e2e-vol-$n:/data/db" \
+      -e MONGO_INITDB_ROOT_USERNAME="$ROOT_USER" -e MONGO_INITDB_ROOT_PASSWORD="$ROOT_PW" \
+      -e RS_KEY="$RS_KEY" -e RS_NAME="$RS_NAME" -e RS_SEEDS="$SEEDS" \
+      -e RAILWAY_PRIVATE_DOMAIN="mongo-$n" -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
+      -e RAILWAY_VOLUME_MOUNT_PATH="/data/db" -e BOOTSTRAP_DWELL_SECONDS=5 \
+      "$IMAGE" >/dev/null
+  done
+  for n in 1 2 3; do
+    wait_until 30 "returning-$n waits for its own DNS" node_logged "returning-$n" "waiting for this node's DNS" \
+      || { bad "missing startup DNS gate on returning-$n"; return; }
+    if docker exec "returning-$n" pgrep -x mongod >/dev/null; then
+      bad "mongod opened the dataset before its private name was registered"; return
+    fi
+  done
+  ok "all restored nodes defer mongod startup while their names are absent"
+  for n in 1 2 3; do
+    docker network disconnect "$NET" "returning-$n"
+    docker network connect --alias "mongo-$n" "$NET" "returning-$n"
+  done
+  wait_until 180 "restored set after DNS registration" set_is_fully_online returning-1 \
+    || { bad "set did not recover after DNS registration"; return; }
+  [ "$(mongo returning-1 'print(rs.conf().settings.replicaSetId.toString())' | tail -1)" = "$before" ] \
+    && ok "existing replica-set identity preserved" || bad "replica-set identity changed"
+  [ "$(mongo returning-1 'print(db.getSiblingDB("t").kv.findOne({_id:"dns-restore"}).v)' | tail -1)" = "preserved" ] \
+    && ok "acknowledged data preserved after delayed DNS" || bad "acknowledged data missing"
+  docker rm -f returning-1 returning-2 returning-3 >/dev/null
+}
+
 ALL_TESTS=(
   t_set_forms_and_replicates
   t_edge_routes_writes_and_authenticates_stats
   t_failover_on_primary_pause
   t_cold_restart_preserves_set
+  t_cold_restart_waits_for_own_dns
   t_switchover_promotes_requested_node
   t_health_api_auth_gates_switchover
   t_sigterm_primary_demotes_before_exit
