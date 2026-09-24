@@ -7,7 +7,8 @@
 //!   3. Start the health server (/health, /role, /rs/state, /switchover; the
 //!      last one behind HTTP Basic auth once HEALTH_API_PASSWORD is set) —
 //!      fail-closed until mongod answers.
-//!   4. Spawn `docker-entrypoint.sh mongod --replSet ... --keyFile ...` (args
+//!   4. For an existing HA dataset, wait for our DNS name to resolve locally.
+//!      Spawn `docker-entrypoint.sh mongod --replSet ... --keyFile ...` (args
 //!      passed through) and supervise it: the container lives and dies with
 //!      mongod.
 //!   5. In the background, run the orchestrator: wait for the final mongod,
@@ -40,6 +41,7 @@ mod process_manager;
 mod replication_monitor;
 mod rs;
 mod standalone_recovery;
+mod startup_dns;
 mod volume_lock;
 
 use anyhow::Result;
@@ -269,6 +271,13 @@ async fn main() -> Result<()> {
         telemetry.clone(),
     ));
 
+    // A restored local replica-set config is validated only once at startup.
+    // If our private name still resolves to an old container (or NXDOMAIN),
+    // mongod rejects its own member identity and cannot elect a primary.
+    // Keep the health server available while registration catches up.
+    if config.rs_enabled() && has_data {
+        startup_dns::wait_for_local_address(&config.private_domain).await?;
+    }
     let child = process_manager::spawn_mongod(&flags, &args).await?;
 
     // HA mode: hand the primary role off before mongod is signaled, so a
