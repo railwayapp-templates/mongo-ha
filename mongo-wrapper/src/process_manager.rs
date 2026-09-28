@@ -38,6 +38,7 @@ pub fn mongod_command(flags: &[String], args: &[String]) -> Command {
         .args(flags)
         .args(args)
         .kill_on_drop(false);
+    crate::kernel_compat::configure_mongod(&mut command);
     command
 }
 

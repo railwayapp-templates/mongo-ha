@@ -274,6 +274,18 @@ entrypoint logs at startup never contains it.
 curl -u "$MONGOUSER:$MONGOPASSWORD" http://<edge>.railway.internal:8404/stats
 ```
 
+## Kernel compatibility
+
+On Linux 6.19.0 through 7.0.13, the wrapper sets `glibc.pthread.rseq=1`
+in the MongoDB child process's `GLIBC_TUNABLES` to avoid
+[SERVER-121912](https://www.mongodb.com/docs/manual/release-notes/8.0/).
+This disables TCMalloc's per-CPU cache optimization and can affect performance
+on those kernels. Other tunables are preserved. On kernels below 6.19.0 or
+at least 7.0.14, the wrapper leaves the inherited environment unchanged.
+The same policy covers initialization, HA, standalone recovery, and restarts;
+it emits one startup log when active. Unknown kernel versions retain the
+inherited settings and MongoDB's own compatibility check.
+
 ## Images
 
 Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml):
@@ -290,6 +302,9 @@ Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml
   HAProxy rendering, replication-monitor threshold derivation against
   synthetic `replSetGetStatus` shapes: healthy, lagging-but-recoverable,
   fallen-off-the-oplog, stuck-RECOVERING/STARTUP2).
+- `./test/kernel-compat.sh` — boots MongoDB with kernel-release fixtures to
+  verify conditional allocator settings and write/read health; the fixtures
+  test policy selection, not a different physical kernel.
 - `./test/e2e.sh` — docker-based end-to-end suite: set formation and
   replication, failover on primary pause, cold restart, switchover, demote
   on SIGTERM, wiped-volume rejoin, standalone-volume conversion, scale-up

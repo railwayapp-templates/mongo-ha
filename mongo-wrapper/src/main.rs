@@ -34,6 +34,7 @@ mod demote_on_shutdown;
 mod dns_probe;
 mod health_auth;
 mod health_server;
+mod kernel_compat;
 mod keyfile;
 mod mongo;
 mod peers;
