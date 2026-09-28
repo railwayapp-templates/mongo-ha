@@ -42,7 +42,7 @@ for release in 6.18.15+deb13-cloud-amd64 6.19.10+deb13-cloud-amd64 7.0.13-generi
     echo "FAIL: MongoDB did not accept writes for kernel fixture $release" >&2
     exit 1
   fi
-  actual=$(docker exec "$name" sh -c '
+  actual=$(docker exec --user mongodb "$name" sh -c '
     for p in /proc/[0-9]*; do
       if [ "$(cat "$p/comm" 2>/dev/null)" = mongod ]; then
         tr "\000" "\n" < "$p/environ" | grep "^GLIBC_TUNABLES="
