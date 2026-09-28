@@ -30,7 +30,7 @@ for release in 6.18.15+deb13-cloud-amd64 6.19.10+deb13-cloud-amd64 7.0.13-generi
   ready=0
   for ((attempt=0; attempt<90; attempt++)); do
     if docker exec "$name" mongosh --quiet -u mongo -p kernel-test-pw --authenticationDatabase admin \
-      --eval 'const c=db.getSiblingDB("kernel_test").probe; c.updateOne({_id:1},{$set:{value:"preserved"}},{upsert:true}); if(c.findOne({_id:1}).value!=="preserved") quit(1)' >/dev/null 2>&1; then
+      --eval 'if(db.adminCommand({getCmdLineOpts:1}).parsed.processManagement?.fork) quit(1); const c=db.getSiblingDB("kernel_test").probe; c.updateOne({_id:1},{$set:{value:"preserved"}},{upsert:true}); if(c.findOne({_id:1}).value!=="preserved") quit(1)' >/dev/null 2>&1; then
       ready=1
       break
     fi
