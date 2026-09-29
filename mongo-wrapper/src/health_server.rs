@@ -8,7 +8,10 @@
 //!                 PRIMARY AND its own view of the set has a reachable
 //!                 majority. HAProxy's write frontend routes exclusively on
 //!                 this. In standalone mode (no RS_SEEDS) it degrades to
-//!                 liveness: a lone node is trivially its own primary.
+//!                 liveness: a lone node is trivially its own primary. The
+//!                 JSON body names the member's own state (see `RoleVerdict`)
+//!                 so a 503 from a SECONDARY and one from a node still in
+//!                 STARTUP2 read differently on the dashboard.
 //!   GET /rs/state — peer exchange (JSON, see peers::RsState): whether this
 //!                 node holds a set, who its primary is, whether it holds user
 //!                 data. 503 until the FINAL mongod answers, so a peer
@@ -190,27 +193,103 @@ impl FailureLog {
 
 static ROLE_FAILURES: Mutex<FailureLog> = Mutex::new(FailureLog::new());
 
+/// What /role answers, decided by the handler and rendered by `role_reply`.
+/// The body is JSON in every case, one vocabulary shared with redis-ha and
+/// mysql-ha (the Railway dashboard's cluster pane reads it engine-blind):
+///
+///   200 {"role":"primary"}
+///   503 {"role":"replica","state":<stateStr>,"ready":<bool>} — a member that
+///       is not the primary; `state` is mongod's own replica-set member state
+///       (SECONDARY, STARTUP2, RECOVERING, ROLLBACK, …) and `ready` says
+///       whether it serves reads as a caught-up member (SECONDARY only).
+///       A dashboard reads three of these with `ready:false` as "syncing",
+///       not as three replicas of nobody.
+///   503 {"role":"fenced","state":"PRIMARY","ready":false} — this node IS the
+///       primary but its own view lacks a majority, so it is pulled from
+///       write rotation ahead of mongod's own step-down.
+///   503 {"role":"unknown","reason":<text>} — mongod could not be asked.
+///
+/// The status code alone remains the routing contract (HAProxy's
+/// `http-check expect status 200`); the body is for people and dashboards.
+#[derive(Debug, PartialEq)]
+enum RoleVerdict {
+    Primary,
+    Fenced { state: String },
+    Replica { state: String },
+    Unavailable(&'static str),
+}
+
+/// The member states in which a non-primary serves reads as an ordinary,
+/// caught-up replica. STARTUP2 (initial sync), RECOVERING and ROLLBACK hold
+/// the dataset in flux; STARTUP, ARBITER, DOWN, UNKNOWN and REMOVED never
+/// serve.
+const READY_REPLICA_STATES: &[&str] = &["SECONDARY"];
+
+fn role_reply(verdict: RoleVerdict) -> (StatusCode, Json<serde_json::Value>) {
+    match verdict {
+        RoleVerdict::Primary => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "role": "primary" })),
+        ),
+        RoleVerdict::Fenced { state } => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "role": "fenced", "state": state, "ready": false })),
+        ),
+        RoleVerdict::Replica { state } => {
+            let ready = READY_REPLICA_STATES.contains(&state.as_str());
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "role": "replica", "state": state, "ready": ready })),
+            )
+        }
+        RoleVerdict::Unavailable(reason) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "role": "unknown", "reason": reason })),
+        ),
+    }
+}
+
+/// This node's own member state as mongod names it, for the /role body.
+/// `hello` alone cannot tell STARTUP2 from SECONDARY, so the answer comes
+/// from `replSetGetStatus`; a node with no config yet is in STARTUP (mongod's
+/// own state before `replSetInitiate`), and one its config no longer lists
+/// is REMOVED.
+async fn own_member_state(mongo: &Mongo) -> anyhow::Result<String> {
+    Ok(match mongo.rs_status().await? {
+        RsStatus::Active { my_state_str, .. } => my_state_str,
+        RsStatus::NotInitialized => "STARTUP".to_string(),
+        RsStatus::NotAMember => "REMOVED".to_string(),
+    })
+}
+
 async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     if state.standalone {
         // No set to fence against — alive means writable.
         return match state.mongo.ping().await {
-            Ok(()) => (StatusCode::OK, "primary (standalone)"),
-            Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "mongod not answering"),
+            Ok(()) => role_reply(RoleVerdict::Primary),
+            Err(_) => role_reply(RoleVerdict::Unavailable("mongod not answering")),
         };
     }
 
     let verdict = async {
         let hello = state.mongo.hello().await?;
         if !hello.is_writable_primary {
-            return anyhow::Ok(false);
+            let state = own_member_state(&state.mongo).await?;
+            return anyhow::Ok(RoleVerdict::Replica { state });
         }
         // mongod steps a primary down on its own once it loses the majority,
         // but only after its election timeout; answering 503 the moment our
         // own view lacks a majority pulls the node from write rotation ahead
         // of that.
         match state.mongo.rs_status().await? {
-            RsStatus::Active { members, .. } => anyhow::Ok(has_majority(&members)),
-            RsStatus::NotInitialized | RsStatus::NotAMember => anyhow::Ok(false),
+            RsStatus::Active { members, .. } if has_majority(&members) => {
+                anyhow::Ok(RoleVerdict::Primary)
+            }
+            RsStatus::Active { .. } | RsStatus::NotInitialized | RsStatus::NotAMember => {
+                anyhow::Ok(RoleVerdict::Fenced {
+                    state: "PRIMARY".to_string(),
+                })
+            }
         }
     }
     .await;
@@ -245,9 +324,8 @@ async fn role(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     }
 
     match verdict {
-        Ok(true) => (StatusCode::OK, "primary"),
-        Ok(false) => (StatusCode::SERVICE_UNAVAILABLE, "not primary"),
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "state unavailable"),
+        Ok(verdict) => role_reply(verdict),
+        Err(_) => role_reply(RoleVerdict::Unavailable("state unavailable")),
     }
 }
 
@@ -586,6 +664,60 @@ mod tests {
             keyfile: keyfile.map(|k| Arc::new(k.to_string())),
             has_data: false,
         })
+    }
+
+    fn split(reply: (StatusCode, Json<serde_json::Value>)) -> (StatusCode, serde_json::Value) {
+        (reply.0, reply.1 .0)
+    }
+
+    #[test]
+    fn role_reply_names_the_member_state_on_a_non_primary() {
+        // The reported case: three nodes mid-election answer 503 — the body
+        // says which of them is a caught-up SECONDARY and which is still in
+        // initial sync, instead of one opaque "not primary".
+        let (status, body) = split(role_reply(RoleVerdict::Replica {
+            state: "SECONDARY".into(),
+        }));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            serde_json::json!({ "role": "replica", "state": "SECONDARY", "ready": true })
+        );
+
+        for state in ["STARTUP2", "RECOVERING", "ROLLBACK", "STARTUP", "REMOVED"] {
+            let (status, body) = split(role_reply(RoleVerdict::Replica {
+                state: state.into(),
+            }));
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["role"], "replica");
+            assert_eq!(body["state"], state);
+            assert_eq!(body["ready"], false, "{state} must not read as ready");
+        }
+    }
+
+    #[test]
+    fn role_reply_keeps_the_status_contract_and_marks_a_fenced_primary() {
+        let (status, body) = split(role_reply(RoleVerdict::Primary));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({ "role": "primary" }));
+
+        // A primary without a majority is out of write rotation (503) but is
+        // not a replica: the body says so, so nobody paints it "Replica".
+        let (status, body) = split(role_reply(RoleVerdict::Fenced {
+            state: "PRIMARY".into(),
+        }));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            serde_json::json!({ "role": "fenced", "state": "PRIMARY", "ready": false })
+        );
+
+        let (status, body) = split(role_reply(RoleVerdict::Unavailable("mongod not answering")));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body,
+            serde_json::json!({ "role": "unknown", "reason": "mongod not answering" })
+        );
     }
 
     #[test]
