@@ -48,6 +48,17 @@ RUN echo "refresh key: ${PKG_REFRESH}" \
 
 COPY --from=rust-binaries --chmod=755 /mongo-wrapper /usr/local/bin/mongo-wrapper
 
+# Railway's standalone `mongo` template starts the official image with its
+# own start command, `docker-entrypoint.sh mongod --ipv6 --bind_ip ::,0.0.0.0
+# ...`. A start command replaces ENTRYPOINT, so a service moved onto this
+# image while keeping that command would run mongod as pid 1 with no wrapper
+# (no featureCompatibilityVersion completion, no health server, no volume
+# lock). The upstream entrypoint is kept under another name and a shim takes
+# its place: `docker-entrypoint.sh mongod ...` lands in the wrapper, which
+# spawns the real upstream entrypoint itself (process_manager.rs).
+RUN mv /usr/local/bin/docker-entrypoint.sh /usr/local/bin/docker-entrypoint-upstream.sh
+COPY --chmod=755 mongo-wrapper/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
 # Runs as root, mirroring redis-ha/mysql-ha: the upstream entrypoint chowns
 # the (runtime-mounted) volume and drops to the `mongodb` user itself before
 # exec'ing mongod, so the wrapper only needs root for that hand-off and for

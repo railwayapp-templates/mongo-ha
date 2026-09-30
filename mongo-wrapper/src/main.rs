@@ -32,11 +32,13 @@ mod config;
 mod credentials;
 mod demote_on_shutdown;
 mod dns_probe;
+mod fcv;
 mod health_auth;
 mod health_server;
 mod kernel_compat;
 mod keyfile;
 mod mongo;
+mod passthrough;
 mod peers;
 mod process_manager;
 mod replication_monitor;
@@ -56,7 +58,21 @@ use tracing::{info, warn};
 async fn main() -> Result<()> {
     let _guard = init_logging("mongo-wrapper");
 
-    let config = Arc::new(Config::from_env()?);
+    // mongod flags handed to this process: the image's CMD, or a start
+    // command written for the official image that the entrypoint shim routed
+    // here (see passthrough.rs). Read before Config is frozen: a `--port` or
+    // `--dbpath` in there is the mongod the wrapper must supervise.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut config = Config::from_env()?;
+    if let Some(port) = passthrough::passthrough_port(&args) {
+        info!(port, "mongod port taken from the passthrough args");
+        config.mongo_port = port;
+    }
+    if let Some(dbpath) = passthrough::passthrough_dbpath(&args) {
+        info!(%dbpath, "mongod dbpath taken from the passthrough args");
+        config.data_dir = dbpath;
+    }
+    let config = Arc::new(config);
     let telemetry =
         Arc::new(tokio::task::spawn_blocking(|| Telemetry::from_env("mongo-ha")).await?);
 
@@ -160,8 +176,9 @@ async fn main() -> Result<()> {
         flags.push(config.data_dir.clone());
     }
     // MONGO_INITDB_ROOT_USERNAME/PASSWORD reach docker-entrypoint.sh through
-    // the inherited process environment, not as CLI args.
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // the inherited process environment, not as CLI args. Own flags the args
+    // already set are dropped here — mongod refuses a repeated option.
+    let mut flags = passthrough::merge_own_flags(&flags, &args);
 
     // Shared by both modes: the health server's mutating route is gated the
     // same way whether or not a set is running.
@@ -261,6 +278,14 @@ async fn main() -> Result<()> {
             telemetry.clone(),
         ));
     }
+
+    // Keeps featureCompatibilityVersion at the running release, both modes
+    // (see fcv.rs): the image finishes the version move a deploy started.
+    tokio::spawn(fcv::reconcile(
+        config.clone(),
+        mongo.clone(),
+        telemetry.clone(),
+    ));
 
     // Proves the boot credentials against the live server, writes the pin,
     // and follows a properly rotated password (see auth_pin::resolver).

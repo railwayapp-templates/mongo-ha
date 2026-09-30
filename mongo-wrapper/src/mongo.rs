@@ -93,6 +93,21 @@ pub mod codes {
     pub const AUTHENTICATION_FAILED: i32 = 18;
 }
 
+/// `featureCompatibilityVersion` as `getParameter` reports it: the value the
+/// data files are at and, while a `setFeatureCompatibilityVersion` is in
+/// flight, the value it is moving to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fcv {
+    pub version: String,
+    pub target: Option<String>,
+}
+
+/// How long `setFeatureCompatibilityVersion` may take before the wrapper
+/// stops waiting and reads the result back instead (see fcv::raise). The
+/// command rewrites catalog metadata and, across a major, on-disk formats;
+/// minutes on a large dataset are normal, not a hang.
+const FCV_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// What `hello` said about the server behind this connection.
 #[derive(Debug, Clone, Default)]
 pub struct Hello {
@@ -706,6 +721,65 @@ impl Mongo {
             isreplicaset: d.get_bool("isreplicaset").unwrap_or(false),
             primary: d.get_str("primary").ok().map(str::to_string),
         })
+    }
+
+    /// The `major.minor` series of the running mongod, from `buildInfo`.
+    pub async fn build_info_series(&self) -> Result<String> {
+        let d = self
+            .admin(doc! { "buildInfo": 1 }, SHORT_COMMAND_TIMEOUT)
+            .await?;
+        let version = d.get_str("version").context("buildInfo has no version")?;
+        crate::fcv::series_of(version)
+            .with_context(|| format!("buildInfo version {version:?} has no major.minor"))
+    }
+
+    /// The data files' `featureCompatibilityVersion` (see fcv.rs).
+    pub async fn fcv(&self) -> Result<Fcv> {
+        let d = self
+            .admin(
+                doc! { "getParameter": 1, "featureCompatibilityVersion": 1 },
+                SHORT_COMMAND_TIMEOUT,
+            )
+            .await?;
+        let f = d
+            .get_document("featureCompatibilityVersion")
+            .context("getParameter reply has no featureCompatibilityVersion")?;
+        Ok(Fcv {
+            version: f
+                .get_str("version")
+                .context("featureCompatibilityVersion has no version")?
+                .to_string(),
+            target: f.get_str("targetVersion").ok().map(str::to_string),
+        })
+    }
+
+    /// `setFeatureCompatibilityVersion` to `series` (`"8.3"`). `confirm` is
+    /// what 7.0+ requires of a caller that read the release notes; this
+    /// wrapper only ever raises to the series the binary itself runs.
+    pub async fn set_fcv(&self, series: &str) -> Result<()> {
+        self.admin(
+            doc! { "setFeatureCompatibilityVersion": series, "confirm": true },
+            FCV_COMMAND_TIMEOUT,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// A direct connection to another member with THIS handle's live
+    /// credentials (a keyfile set shares the root account; a rotated
+    /// password reaches every member). Short-lived: the caller `shutdown`s
+    /// it once it has its answer.
+    pub async fn peer(&self, addr: &str) -> Mongo {
+        let password = self.password.read().await.clone();
+        Self::connect_member(addr, &self.username, &password)
+    }
+
+    /// Release this handle's pooled client (its connections and background
+    /// workers). For the throwaway handles `peer` builds; the wrapper's own
+    /// local handle lives as long as the process.
+    pub async fn shutdown(self) {
+        let client = self.pool.read().await.client.clone();
+        client.shutdown().await;
     }
 
     pub async fn rs_status(&self) -> Result<RsStatus> {
