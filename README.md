@@ -166,6 +166,31 @@ The `mongo-wrapper` binary (one per data node):
   and retries the command once. Without it an initial-synced member's
   `/rs/state` and `/role` stay 503 for the life of the process, so an
   election that promotes it never reaches HAProxy.
+- **Feature-compatibility-version completion.** MongoDB does not finish a
+  version move on its own: after the binary moves from 8.2 to 8.3 the data
+  files stay at `featureCompatibilityVersion` 8.2 until somebody runs
+  `setFeatureCompatibilityVersion`, and mongod N boots only on FCV N or N-1 —
+  a service left half-upgraded crashes on the NEXT move. On every boot, once
+  mongod answers, the wrapper raises FCV to the running series (`confirm:
+  true`) and reads it back; in a set only the primary does, and only once
+  every member is healthy and reports the same binary series (a raise would
+  strand a member still on the old binary mid rolling-upgrade). It keeps
+  re-checking for the life of the process (`FCV_RECHECK_SECONDS`, default
+  600), so a set whose primary moved last is completed without a restart.
+  Nothing lowers FCV and nothing fails the boot: a failed step is logged, sent
+  as a component error, and retried. This is what makes a floating major tag
+  (`:8`) safe for a standalone — the image completes whatever the tag
+  resolves to, the way MySQL converts its data directory on first start.
+- **Start command written for the official image.** Railway's standalone
+  template starts `mongo:8.0` with `docker-entrypoint.sh mongod --ipv6
+  --bind_ip ::,0.0.0.0 --setParameter diagnosticDataCollectionEnabled=false`.
+  A start command replaces ENTRYPOINT, so on this image that command would run
+  mongod as pid 1 with no wrapper. The image keeps upstream's entrypoint as
+  `docker-entrypoint-upstream.sh` and ships a shim in its place: `mongod …`
+  is routed into `mongo-wrapper …`, which spawns the upstream entrypoint
+  itself; the command's mongod flags are merged with the wrapper's own (an
+  option the command sets is not repeated — mongod refuses duplicates — and a
+  `--port` / `--dbpath` in the command is what the wrapper supervises).
 - **Standalone mode.** Without `RS_SEEDS` (or with `RS_ENABLED=false`, which
   the revert flow sets) mongod runs with no `--replSet`, exactly as the
   upstream image would. A volume that ran as a replica set member (every HA
@@ -294,6 +319,13 @@ Published to GHCR by [`build-and-push.yml`](.github/workflows/build-and-push.yml
   rebuilt line per MongoDB `X.Y` series Docker Hub publishes for the
   supported majors (7, 8), discovered every run; a bundled-version guard
   refuses to publish a tag whose base bundles a different series.
+- `ghcr.io/railwayapp-templates/mongo-ha/mongo:<X>` — the floating major
+  (`:8`): the highest published series of that major, the resolution Docker
+  Hub gives `mongo:8`, minted after every series line built and never moved
+  backwards. For a STANDALONE service only — the platform's vuln lane re-pins
+  a service whose `X.Y` line died upstream to it, which is safe because the
+  wrapper completes the version move on boot (see FCV above). Cluster
+  members stay minor-pinned.
 - `ghcr.io/railwayapp-templates/mongo-ha/haproxy:3.2` — the edge.
 
 ## Testing

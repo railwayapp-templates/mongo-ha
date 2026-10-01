@@ -382,6 +382,75 @@ jobs:
             -t "${{ env.IMAGE_PREFIX }}/mongo:${{ matrix.mongo_version }}${{ env.BETA_SUFFIX }}" \
             "$img"
 
+  # The floating MAJOR tag (`:8`, `:7`): the highest published `X.Y` series of
+  # each supported major — the resolution Docker Hub gives `mongo:8`. This is
+  # the tag the platform's vuln lane re-pins a STANDALONE service to when its
+  # `X.Y` line dies upstream (MongoDB 8.2 → `:8`), and it is safe to float
+  # only because the wrapper completes the version move on boot
+  # (featureCompatibilityVersion — mongo-wrapper/src/fcv.rs). Cluster members
+  # stay minor-pinned by construction and never use it. Minted only after
+  # EVERY series build line succeeded, and never moved backwards.
+  publish-major-tags:
+    needs: [discover-mongo-series, build-mongo-wrapper-amd64]
+    if: ${{ !cancelled() && needs.build-mongo-wrapper-amd64.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Point each major tag at its highest published series
+        env:
+          SERIES_JSON: ${{ needs.discover-mongo-series.outputs.series }}
+        run: |
+          set -o pipefail
+          IMG="${{ env.IMAGE_PREFIX }}/mongo"
+          # MONGO_VERSION=X.Y.Z as the official image bakes it (and this one
+          # inherits): the series a tag actually bundles, read from the
+          # registry without pulling.
+          bundled_series() {
+            docker buildx imagetools inspect "$1" --format '{{json .Image}}' 2>/dev/null \
+              | jq -r '(.config // .["linux/amd64"].config).Env[]? // empty' \
+              | sed -nE 's/^MONGO_VERSION=([0-9]+\.[0-9]+).*/\1/p' | head -1
+          }
+          for major in $MONGO_SUPPORTED_MAJORS; do
+            top=$(echo "$SERIES_JSON" | jq -r --arg m "$major" '.[] | select(startswith($m + "."))' | sort -V | tail -1)
+            if [ -z "$top" ]; then
+              echo "no discovered series for major $major" >&2
+              exit 1
+            fi
+            src="$IMG:${top}${{ env.BETA_SUFFIX }}"
+            got=$(bundled_series "$src")
+            if [ "$got" != "$top" ]; then
+              echo "$src bundles '${got:-nothing}', not $top; refusing to float :$major onto it" >&2
+              exit 1
+            fi
+            dst="$IMG:${major}${{ env.BETA_SUFFIX }}"
+            cur=$(bundled_series "$dst" || true)
+            if [ -n "$cur" ] && [ "$(printf '%s\n%s\n' "$cur" "$top" | sort -V | tail -1)" != "$top" ]; then
+              echo "$dst already floats at $cur, above the discovered top $top; not moving it backwards" >&2
+              exit 1
+            fi
+            if [ "$cur" = "$top" ]; then
+              echo ":$major already at $top"
+            else
+              echo ":$major → $top (was ${cur:-unset})"
+            fi
+            # imagetools create only adds a tag reference: same digest as the
+            # series tag, so a digest-tracking consumer sees no new build.
+            docker buildx imagetools create -t "$dst" "$src"
+          done
+
   # Build haproxy image for AMD64
   build-haproxy-amd64:
     needs: [changes, build-rust-binaries-haproxy-amd64]

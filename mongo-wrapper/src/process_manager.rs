@@ -32,7 +32,10 @@ pub async fn spawn_mongod(flags: &[String], args: &[String]) -> Result<Child> {
 /// spawned, for a caller that needs to shape its stdio first (the recovery
 /// boot reads mongod's log to reach its verdict, see standalone_recovery.rs).
 pub fn mongod_command(flags: &[String], args: &[String]) -> Command {
-    let mut command = Command::new("docker-entrypoint.sh");
+    // The upstream entrypoint under the name the Dockerfile keeps it at:
+    // `docker-entrypoint.sh` on this image is the shim that routes a start
+    // command written for the official image back into this wrapper.
+    let mut command = Command::new("docker-entrypoint-upstream.sh");
     command
         .arg("mongod")
         .args(flags)

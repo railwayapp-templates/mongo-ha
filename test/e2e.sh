@@ -112,6 +112,7 @@ start_node() {
     -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
     -e RAILWAY_VOLUME_MOUNT_PATH="/data/db" \
     -e BOOTSTRAP_DWELL_SECONDS=5 \
+    -e FCV_RECHECK_SECONDS=5 \
     "$@" \
     "$IMAGE" >/dev/null
 }
@@ -309,6 +310,27 @@ exactly_one_primary() {
 }
 
 node_logged() { docker logs "$1" 2>&1 | grep -F "$2" >/dev/null; }
+
+# fcv_of <node> — the data files' featureCompatibilityVersion ("8.0").
+fcv_of() {
+  mongo "$1" 'print(db.adminCommand({getParameter: 1, featureCompatibilityVersion: 1}).featureCompatibilityVersion.version)' | tail -1 | tr -d '[:space:]'
+}
+fcv_is() { [ "$(fcv_of "$1")" = "$2" ]; }
+
+# previous_series <X.Y> — the FCV one step below a series (8.0 → 7.0, 8.3 →
+# 8.2): what a data dir carries after the binary moved and nothing completed
+# the move. mongod N accepts FCV N-1, so lowering to it is how a scenario
+# manufactures that state on a single image version.
+previous_series() {
+  local major="${1%%.*}" minor="${1##*.}"
+  if [ "$minor" = "0" ]; then echo "$((major - 1)).0"; else echo "$major.$((minor - 1))"; fi
+}
+
+# lower_fcv <node> — setFeatureCompatibilityVersion to the previous series,
+# through the given node (the primary, in a set). Prints mongod's ok field.
+lower_fcv() {
+  mongo "$1" "print(db.adminCommand({setFeatureCompatibilityVersion: '$(previous_series "$MONGO_VERSION")', confirm: true}).ok)" | tail -1 | tr -d '[:space:]'
+}
 
 # ---------------------------------------------------------------------------
 
@@ -1213,11 +1235,113 @@ t_cold_restart_waits_for_own_dns() {
   docker rm -f returning-1 returning-2 returning-3 >/dev/null
 }
 
+# A standalone whose data files lag the binary — the state a service is in
+# right after any deploy moved its image across a minor — is completed on the
+# next boot: the wrapper raises featureCompatibilityVersion to the running
+# series and verifies it (see mongo-wrapper/src/fcv.rs).
+t_standalone_boot_completes_fcv() {
+  log "t_standalone_boot_completes_fcv"
+  local prev; prev="$(previous_series "$MONGO_VERSION")"
+  docker rm -f fcv-1 >/dev/null 2>&1; docker volume rm mongo-ha-e2e-vol-fcv-1 >/dev/null 2>&1
+  start_standalone fcv-1
+  wait_until 120 "standalone up at FCV $MONGO_VERSION" fcv_is fcv-1 "$MONGO_VERSION" \
+    || { bad "standalone did not come up at FCV $MONGO_VERSION"; return; }
+  mongo fcv-1 'db.getSiblingDB("t").kv.insertOne({_id: "fcv", v: "before"})' | grep -q acknowledged \
+    || { bad "canary write not acknowledged"; return; }
+  [ "$(lower_fcv fcv-1)" = "1" ] && fcv_is fcv-1 "$prev" \
+    || { bad "could not lower FCV to $prev to stage the half-upgraded state"; return; }
+  log "FCV lowered to $prev; restarting the container"
+  docker restart -t 60 fcv-1 >/dev/null
+  wait_until 180 "FCV raised back to $MONGO_VERSION on boot" fcv_is fcv-1 "$MONGO_VERSION" \
+    && ok "standalone boot raised FCV $prev → $MONGO_VERSION" \
+    || bad "FCV still $(fcv_of fcv-1) after the restart"
+  node_logged fcv-1 "featureCompatibilityVersion raised and verified" \
+    && ok "wrapper logged the verified raise" || bad "no verified-raise log line"
+  [ "$(mongo fcv-1 'print(db.getSiblingDB("t").kv.findOne({_id: "fcv"}).v)' | tail -1)" = "before" ] \
+    && ok "data intact across the completion" || bad "canary missing after the completion"
+  docker rm -f fcv-1 >/dev/null 2>&1; docker volume rm mongo-ha-e2e-vol-fcv-1 >/dev/null 2>&1
+}
+
+# Railway's standalone template starts the OFFICIAL image with a start
+# command; a start command replaces ENTRYPOINT. A service moved onto this
+# image with that command kept must still boot through the wrapper (the
+# entrypoint shim), with the command's mongod flags merged into the wrapper's
+# own — and the FCV completion covers this boot path too.
+t_stock_start_command_runs_through_wrapper() {
+  log "t_stock_start_command_runs_through_wrapper"
+  local prev; prev="$(previous_series "$MONGO_VERSION")"
+  docker rm -f stock-1 >/dev/null 2>&1; docker volume rm mongo-ha-e2e-vol-stock-1 >/dev/null 2>&1
+  docker volume create --label "$LABEL" mongo-ha-e2e-vol-stock-1 >/dev/null
+  docker run -d --label "$LABEL" --restart unless-stopped \
+    --name stock-1 --hostname stock-1 \
+    --network "$NET" --network-alias stock-1 \
+    -v "mongo-ha-e2e-vol-stock-1:/data/db" \
+    -e MONGO_INITDB_ROOT_USERNAME="$ROOT_USER" \
+    -e MONGO_INITDB_ROOT_PASSWORD="$ROOT_PW" \
+    -e RAILWAY_PRIVATE_DOMAIN=stock-1 \
+    -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
+    -e RAILWAY_VOLUME_MOUNT_PATH="/data/db" \
+    --entrypoint docker-entrypoint.sh \
+    "$IMAGE" mongod --ipv6 --bind_ip ::,0.0.0.0 --setParameter diagnosticDataCollectionEnabled=false >/dev/null
+  wait_until 120 "mongod up behind the stock start command" fcv_is stock-1 "$MONGO_VERSION" \
+    || { bad "mongod did not come up behind the stock start command"; return; }
+  [ "$(docker exec stock-1 cat /proc/1/comm 2>/dev/null)" = "mongo-wrapper" ] \
+    && ok "pid 1 is the wrapper, not mongod" || bad "pid 1 is $(docker exec stock-1 cat /proc/1/comm 2>/dev/null), not mongo-wrapper"
+  docker exec stock-1 wget -q -O /dev/null http://127.0.0.1:8080/health \
+    && ok "health server answers behind the stock start command" || bad "no health server on 8080"
+  local cmdline
+  cmdline="$(docker exec stock-1 bash -c 'tr "\0" " " < /proc/$(pgrep -x mongod | head -1)/cmdline')"
+  if [ "$(printf '%s' "$cmdline" | grep -o -- '--ipv6' | wc -l | tr -d ' ')" = "1" ] \
+     && printf '%s' "$cmdline" | grep -q -- '--bind_ip ::,0.0.0.0' \
+     && ! printf '%s' "$cmdline" | grep -q -- '--bind_ip_all' \
+     && printf '%s' "$cmdline" | grep -q 'diagnosticDataCollectionEnabled=false'; then
+    ok "mongod flags merged: one --ipv6, the command's --bind_ip, its setParameter"
+  else
+    bad "unexpected mongod command line: $cmdline"
+  fi
+  [ "$(lower_fcv stock-1)" = "1" ] && fcv_is stock-1 "$prev" \
+    || { bad "could not lower FCV to $prev"; return; }
+  docker restart -t 60 stock-1 >/dev/null
+  wait_until 180 "FCV raised on the stock-command boot" fcv_is stock-1 "$MONGO_VERSION" \
+    && ok "stock-command boot raised FCV $prev → $MONGO_VERSION" \
+    || bad "FCV still $(fcv_of stock-1) after the restart"
+  docker rm -f stock-1 >/dev/null 2>&1; docker volume rm mongo-ha-e2e-vol-stock-1 >/dev/null 2>&1
+}
+
+# In a set the primary raises FCV — and keeps doing so for the life of the
+# process, so a set that ends up lagging (its primary redeployed last, or an
+# operator lowered it) is completed by the running primary without a
+# restart. Secondaries only ever wait.
+t_replica_set_raises_fcv_on_the_primary() {
+  log "t_replica_set_raises_fcv_on_the_primary (reuses the running trio)"
+  set_is_fully_online mongo-2 || ensure_trio
+  wait_until 300 "set online" set_is_fully_online mongo-1 || { bad "no set"; return; }
+  local prev primary n
+  prev="$(previous_series "$MONGO_VERSION")"
+  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" || { bad "no primary"; return; }
+  [ "$(lower_fcv "$primary")" = "1" ] && fcv_is "$primary" "$prev" \
+    || { bad "could not lower the set's FCV to $prev"; return; }
+  log "set FCV lowered to $prev through $primary; waiting for the primary's re-check"
+  wait_until 120 "primary raised FCV back to $MONGO_VERSION" fcv_is "$primary" "$MONGO_VERSION" \
+    && ok "running primary $primary raised the set's FCV $prev → $MONGO_VERSION" \
+    || bad "set FCV still $(fcv_of "$primary")"
+  node_logged "$primary" "featureCompatibilityVersion raised and verified" \
+    && ok "primary logged the verified raise" || bad "primary has no verified-raise log line"
+  for n in mongo-1 mongo-2 mongo-3; do
+    [ "$n" = "$primary" ] && continue
+    if node_logged "$n" "featureCompatibilityVersion raised and verified"; then
+      bad "secondary $n raised FCV itself"; return
+    fi
+  done
+  ok "no secondary raised FCV"
+}
+
 ALL_TESTS=(
   t_set_forms_and_replicates
   t_edge_routes_writes_and_authenticates_stats
   t_failover_on_primary_pause
   t_cold_restart_preserves_set
+  t_replica_set_raises_fcv_on_the_primary
   t_cold_restart_waits_for_own_dns
   t_switchover_promotes_requested_node
   t_health_api_auth_gates_switchover
@@ -1230,6 +1354,8 @@ ALL_TESTS=(
   t_deleted_member_is_pruned
   t_revert_to_standalone_and_reconvert
   t_revert_after_crash_preserves_unflushed_writes
+  t_standalone_boot_completes_fcv
+  t_stock_start_command_runs_through_wrapper
   t_password_variable_edit_does_not_rotate
   t_fresh_member_adopts_live_keyfile
   t_missing_rs_key_refuses_boot
