@@ -223,6 +223,25 @@ const RESOLVE_INTERVAL: Duration = Duration::from_secs(30);
 ///
 /// Returns once the pin is proven and nothing disagrees — an edit made after
 /// that reaches a NEW process (the redeploy), which starts its own resolver.
+/// docker-entrypoint.sh's first-boot init server: it runs without `--auth`
+/// and before the root user exists, so every credential probe against it
+/// answers AccessDenied — a verdict about nothing. Its pid file lives exactly
+/// as long as it does (`rm -f "$pidfile"` follows the `--shutdown`), so the
+/// resolver waits it out instead of reporting a drift that never happened.
+const INIT_SERVER_PID_FILE: &str = "docker-entrypoint-temp-mongod.pid";
+
+fn init_server_running_in(tmp: &std::path::Path) -> bool {
+    tmp.join(INIT_SERVER_PID_FILE).exists()
+}
+
+fn init_server_running() -> bool {
+    let tmp = std::env::var_os("TMPDIR").unwrap_or_else(|| "/tmp".into());
+    init_server_running_in(std::path::Path::new(&tmp))
+}
+
+/// How often the resolver looks again while the init server is still up.
+const INIT_SERVER_POLL: Duration = Duration::from_secs(2);
+
 pub async fn resolver(
     data_dir: String,
     env_password: String,
@@ -234,6 +253,13 @@ pub async fn resolver(
     let mut proven = false;
     let mut drift_reported = false;
     loop {
+        if init_server_running() {
+            debug!(
+                "docker-entrypoint's init server is still up; not judging credentials against it"
+            );
+            tokio::time::sleep(INIT_SERVER_POLL).await;
+            continue;
+        }
         if let Some(pending) = crate::credentials::pending_password(&data_dir) {
             if pending != active
                 && matches!(
@@ -336,6 +362,25 @@ pub fn active_password(config: &crate::config::Config) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_init_servers_pid_file_is_the_wait_signal() {
+        let dir = std::env::temp_dir().join(format!(
+            "mongo-ha-auth-pin-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!super::init_server_running_in(&dir));
+        std::fs::write(dir.join(super::INIT_SERVER_PID_FILE), "42\n").unwrap();
+        assert!(super::init_server_running_in(&dir));
+        std::fs::remove_file(dir.join(super::INIT_SERVER_PID_FILE)).unwrap();
+        assert!(!super::init_server_running_in(&dir));
+        let _ = std::fs::remove_dir(&dir);
+    }
+
     use super::*;
 
     #[test]
