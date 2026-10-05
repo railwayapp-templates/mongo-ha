@@ -58,7 +58,16 @@ decisions:
 - `GET /role` — the routing signal. 200 **only** when this node is the
   replica set PRIMARY **and** its own view of the set has a reachable
   majority; 503 in every other case, including when the node cannot confirm
-  its own status.
+  its own status. The body is JSON, one vocabulary shared with redis-ha and
+  mysql-ha (the Railway dashboard reads it engine-blind):
+  `{"role":"primary"}` on a 200; on a 503,
+  `{"role":"replica","state":<stateStr>,"ready":<bool>}` for a member that is
+  not the primary (`state` is mongod's own member state — `SECONDARY`,
+  `STARTUP2`, `RECOVERING`, … — and `ready` is true only for a `SECONDARY`),
+  `{"role":"fenced","state":"PRIMARY","ready":false}` for a primary without a
+  majority, `{"role":"unknown","reason":…}` when mongod cannot be asked. Only
+  the status code is the routing contract; the body is for people and
+  dashboards.
 - `GET /rs/state` — peer exchange (JSON): whether this node holds a set, its
   primary, whether it holds user data, and this node's own current oplog
   window (`oplog_window_seconds`, see Monitoring below). Consumed by peers'
