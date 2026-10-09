@@ -149,8 +149,9 @@ async fn main() -> Result<()> {
         // Reported again, with the verdict, by the resolver once mongod
         // answers; this is the boot-time heads-up.
         warn!(
-            "the environment's root password / RS_KEY differ from this volume's credential pin; \
-             booting on the pinned values (the variables only initialize a fresh data dir)"
+            "The current password in MONGO_INITDB_ROOT_PASSWORD or RS_KEY doesn't match the \
+             database's. This node keeps using the database's current credentials. Regenerate \
+             the password from the database's Credentials tab."
         );
     }
 

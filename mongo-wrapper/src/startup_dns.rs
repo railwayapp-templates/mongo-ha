@@ -31,7 +31,7 @@ pub async fn wait_for_local_address(host: &str) -> Result<()> {
     })
     .await;
     if ready.is_err() {
-        bail!("own replica-set hostname {host} did not resolve to a local address within 120s; refusing to open the dataset");
+        bail!("This node's hostname {host} didn't resolve to this container within 120s, so the data isn't opened. Check that {host} exists in this environment and is running.");
     }
     info!(%host, "replica-set hostname resolves to this container");
     Ok(())

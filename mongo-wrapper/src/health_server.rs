@@ -49,7 +49,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 pub struct AppState {
     pub mongo: Mongo,
@@ -552,19 +552,19 @@ pub async fn run_health_server_supervised(
 
         let failure = match outcome {
             Ok(Ok(())) => {
-                error!("health server returned unexpectedly; restarting");
+                warn!("health server returned unexpectedly; restarting in 5s");
                 "run loop returned cleanly".to_string()
             }
             Ok(Err(e)) => {
-                error!(error = %format!("{e:#}"), "health server failed; restarting");
+                warn!(error = %format!("{e:#}"), "health server failed; restarting in 5s");
                 format!("bind/serve failed: {e:#}")
             }
             Err(e) if e.is_panic() => {
-                error!(panic = ?e, "health server panicked; restarting");
+                warn!(panic = ?e, "health server panicked; restarting in 5s");
                 "task panicked".to_string()
             }
             Err(e) => {
-                error!(error = %format!("{e:#}"), "health server task was cancelled; restarting");
+                warn!(error = %format!("{e:#}"), "health server task was cancelled; restarting in 5s");
                 "task cancelled".to_string()
             }
         };

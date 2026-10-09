@@ -296,7 +296,7 @@ pub async fn resolver(
                     // the environment probe below succeeding.
                     if !drift_reported {
                         drift_reported = true;
-                        let error = "the pinned root password is refused by mongod and MONGO_INITDB_ROOT_PASSWORD carries no working alternative; the wrapper cannot run admin commands until the stored user matches one of them"
+                        let error = "No known root password works. Regenerate the password from the database's Credentials tab."
                             .to_string();
                         error!("{error}");
                         telemetry.send(TelemetryEvent::ComponentError {
@@ -331,7 +331,7 @@ pub async fn resolver(
                 PasswordProbe::AccessDenied => {
                     if !drift_reported {
                         drift_reported = true;
-                        let error = "MONGO_INITDB_ROOT_PASSWORD differs from the password mongod enforces; the variable only initializes a fresh data dir, so the wrapper keeps using the pinned password. Rotate the stored user (db.changeUserPassword) before or after the edit, and note the keyfile (RS_KEY) never follows an edit: new members adopt the live set's keyfile from a peer instead"
+                        let error = "The current password in MONGO_INITDB_ROOT_PASSWORD doesn't match the database's. This node keeps using the database's current password. Regenerate the password from the database's Credentials tab."
                             .to_string();
                         warn!("{error}");
                         telemetry.send(TelemetryEvent::ComponentError {

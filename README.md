@@ -230,9 +230,8 @@ The `mongo-wrapper` binary (one per data node):
 ## Monitoring / observability
 
 The `replication_monitor` module (`mongo-wrapper/src/replication_monitor.rs`)
-watches for the failure mode field data (Atlas's own oplog-window alert, a
-community-forum operator's 15+ hour stale-secondary incident) shows is the
-most common way a MongoDB replica set silently loses redundancy: a member
+watches for the most common way a MongoDB replica set silently loses
+redundancy: a member
 whose replication has fallen behind far enough that it can no longer catch up
 incrementally and needs a full resync. **This is observation and reporting
 only — no self-heal, no auto-resync, no remediation** (see Status below).

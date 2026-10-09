@@ -237,14 +237,12 @@ pub fn recovery_failed_guidance(code: Option<i32>, last_fatal: Option<&str>) -> 
         .map(|l| format!("; its last fatal line: {l}"))
         .unwrap_or_default();
     format!(
-        "the replica set volume could not be recovered for a standalone boot: the recovery mongod \
-         (recoverFromOplogAsStandalone) {exit} before it came up{fatal}. The data \
-         directory is unchanged. Booting it standalone without that replay would drop every \
-         collection and index created after its last checkpoint and lose the writes after it, so \
-         this node stops here. Fix: re-enable HA on this service (RS_ENABLED=true with its previous \
-         RS_SEEDS and RS_KEY) so mongod boots the volume as a replica set member and recovers it \
-         itself, then revert again once it is up. A volume that fails here again needs a restore \
-         from a backup."
+        "This node's data couldn't be prepared for a standalone start: the recovery step \
+         (recoverFromOplogAsStandalone) {exit} before it came up{fatal}. The data directory is \
+         unchanged. Starting standalone without that step would lose the writes after the last \
+         checkpoint, so this node stops here. To fix it, set RS_ENABLED=true and restore RS_SEEDS \
+         and RS_KEY to the values this service had before the revert, then redeploy. Once the \
+         node is up, revert to standalone again. If it stops here again, restore from a backup."
     )
 }
 
@@ -575,7 +573,7 @@ mod tests {
             "RS_ENABLED=true",
             "RS_SEEDS",
             "RS_KEY",
-            "revert again",
+            "revert to standalone again",
             "data directory is unchanged",
             "restore from a backup",
         ] {

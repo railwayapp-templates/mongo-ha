@@ -1088,12 +1088,12 @@ t_password_variable_edit_does_not_rotate() {
   [ "$v" = "before-edit" ] && ok "old root password still authenticates; data intact" || bad "old password lost or data missing (got '$v')"
   wait_until 60 "exactly one primary after the roll" exactly_one_primary mongo-2 mongo-1 mongo-2 mongo-3 \
     && ok "/role fence intact after the roll (wrapper still authenticated)" || bad "no single /role 200 after the roll"
-  if node_logged mongo-1 "differ from this volume's credential pin"; then
+  if node_logged mongo-1 "keeps using the database's current credentials"; then
     ok "drift between environment and pin logged at boot"
   else
     bad "no credential-drift warning logged"
   fi
-  wait_until 90 "drift verdict logged by the resolver" bash -c 'docker logs mongo-1 2>&1 | grep -F "differs from the password mongod" >/dev/null' \
+  wait_until 90 "drift verdict logged by the resolver" bash -c 'docker logs mongo-1 2>&1 | grep -F "current password. Regenerate" >/dev/null' \
     && ok "resolver reported the unrotated edit" || bad "resolver never reported the drift"
 
   # A proper rotation: change the stored user to the environment's value; the
