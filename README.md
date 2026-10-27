@@ -104,6 +104,13 @@ template stamps `HEALTH_API_PASSWORD` as the set's
 day one; an existing set enforces once the variable is set on its data
 nodes and they redeploy.
 
+A password rotation moves the root password on every member without
+redeploying it, so the variable a node booted with lags the password the set
+enforces. When `HEALTH_API_PASSWORD` is the root password of that boot and the
+volume pins a different one (`.railway-mongo-auth-pin`), the route accepts the
+pinned password — the same rule mysql-ha and redis-ha apply. A dedicated
+`HEALTH_API_PASSWORD` is compared as written.
+
 HAProxy's write frontend marks a node UP only while its `/role` returns 200,
 with `default-server fall 2 rise 2 on-marked-down shutdown-sessions` — the
 first failed check switches probing to the fast interval (500ms), so a real

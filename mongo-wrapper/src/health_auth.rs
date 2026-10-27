@@ -60,7 +60,13 @@ async fn require(State(guard): State<Guard>, req: Request, next: Next) -> Respon
     let Some(expected) = guard.as_ref() else {
         return next.run(req).await;
     };
-    if authorized(expected, req.headers().get(header::AUTHORIZATION)) {
+    let pinned = crate::auth_pin::read_pin(&crate::config::data_dir_from_env()).map(|p| p.password);
+    let live = live_credential(
+        expected,
+        std::env::var("MONGO_INITDB_ROOT_PASSWORD").ok().as_deref(),
+        pinned.as_deref(),
+    );
+    if authorized(&live, req.headers().get(header::AUTHORIZATION)) {
         return next.run(req).await;
     }
     warn!(
@@ -69,6 +75,30 @@ async fn require(State(guard): State<Guard>, req: Request, next: Next) -> Respon
         "refused a request to a mutating route: missing or wrong credential"
     );
     unauthorized()
+}
+
+/// The credential a request is compared against right now. The template
+/// stamps `HEALTH_API_PASSWORD` as the set's root password, and a password
+/// rotation moves that password on every member without redeploying it, so
+/// the credential this process booted with would refuse the platform's stored
+/// one until the next deploy. When the configured password is the root
+/// password of this boot and the volume pins a different one, the pin is the
+/// live password — the rule mysql-ha and redis-ha apply. A dedicated
+/// `HEALTH_API_PASSWORD` (not the root password) is never swapped.
+pub fn live_credential(
+    expected: &Credential,
+    env_root_password: Option<&str>,
+    pinned_password: Option<&str>,
+) -> Credential {
+    match (env_root_password, pinned_password) {
+        (Some(root), Some(pin)) if expected.password == root.trim() && pin != expected.password => {
+            Credential {
+                username: expected.username.clone(),
+                password: pin.to_string(),
+            }
+        }
+        _ => expected.clone(),
+    }
 }
 
 fn unauthorized() -> Response {
@@ -141,6 +171,49 @@ mod tests {
 
     fn hv(s: &str) -> HeaderValue {
         HeaderValue::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn the_live_credential_follows_the_pin_only_when_it_mirrors_the_root_password() {
+        let configured = Credential {
+            username: "railway".into(),
+            password: "root-at-boot".into(),
+        };
+        // No pin, or a pin equal to the boot password: nothing to follow.
+        assert_eq!(
+            live_credential(&configured, Some("root-at-boot"), None),
+            configured
+        );
+        assert_eq!(
+            live_credential(&configured, Some("root-at-boot"), Some("root-at-boot")),
+            configured
+        );
+        // The template's shape after a rotation: HEALTH_API_PASSWORD still holds
+        // the root password this boot started with, the volume pins the rotated
+        // one. The rotated password is what the platform sends.
+        let rotated = live_credential(&configured, Some("root-at-boot"), Some("rotated"));
+        assert_eq!(rotated.username, "railway");
+        assert_eq!(rotated.password, "rotated");
+        assert!(authorized(&rotated, Some(&hv(&basic_header(&rotated)))));
+        assert!(!authorized(&rotated, Some(&hv(&basic_header(&configured)))));
+        // The root variable is trimmed the way HEALTH_API_PASSWORD is.
+        assert_eq!(
+            live_credential(&configured, Some(" root-at-boot \n"), Some("rotated")).password,
+            "rotated"
+        );
+        // A dedicated HEALTH_API_PASSWORD is never swapped, pin or not.
+        let dedicated = Credential {
+            username: "ops".into(),
+            password: "its-own-secret".into(),
+        };
+        assert_eq!(
+            live_credential(&dedicated, Some("root-at-boot"), Some("rotated")),
+            dedicated
+        );
+        assert_eq!(
+            live_credential(&dedicated, None, Some("rotated")),
+            dedicated
+        );
     }
 
     #[test]
