@@ -119,9 +119,7 @@ impl Config {
             ),
             health_api_password: health_api_password_from(health_api_password_raw),
             private_domain: RailwayEnv::private_domain(),
-            data_dir: non_empty(std::env::var("DATA_DIR").ok())
-                .or_else(|| non_empty(std::env::var("RAILWAY_VOLUME_MOUNT_PATH").ok()))
-                .unwrap_or_else(|| "/data/db".to_string()),
+            data_dir: data_dir_from_env(),
             peer_query_timeout_ms: u64::env_parse("PEER_QUERY_TIMEOUT_MS", 2000),
             bootstrap_dwell_seconds: u64::env_parse("BOOTSTRAP_DWELL_SECONDS", 15),
             demote_timeout_ms: u64::env_parse("DEMOTE_TIMEOUT_MS", 20_000),
@@ -218,6 +216,14 @@ pub(crate) fn health_api_username_from(raw: Option<String>) -> String {
     non_empty(raw)
         .map(|u| u.trim().to_string())
         .unwrap_or_else(|| DEFAULT_HEALTH_API_USERNAME.to_string())
+}
+
+/// Where this node keeps its data and its credential pin: `DATA_DIR`, else
+/// `RAILWAY_VOLUME_MOUNT_PATH`, else mongod's default.
+pub(crate) fn data_dir_from_env() -> String {
+    non_empty(std::env::var("DATA_DIR").ok())
+        .or_else(|| non_empty(std::env::var("RAILWAY_VOLUME_MOUNT_PATH").ok()))
+        .unwrap_or_else(|| "/data/db".to_string())
 }
 
 /// `HEALTH_API_PASSWORD` as the health server compares it: trimmed; unset or
