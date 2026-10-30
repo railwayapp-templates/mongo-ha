@@ -2,8 +2,9 @@
 //! Keyfiles change in two ordered rolling passes: both keys, then target
 //! only. A lost HTTP response can safely repeat every phase.
 use crate::auth_pin::{read_pin, write_pin, AuthPin};
+use crate::dns_probe::{probe_name_detailed, NameVerdict};
 use crate::health_server::AppState;
-use crate::mongo::PasswordProbe;
+use crate::mongo::{has_majority, split_host_port, Mongo, PasswordProbe, RsStatus};
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -13,7 +14,9 @@ use base64::Engine;
 use mongodb::bson::doc;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 
@@ -35,8 +38,47 @@ fn target_keyfile(request: &Rotation, overlap: bool) -> String {
         new_key
     }
 }
-fn healthy_set(status: &crate::mongo::RsStatus) -> bool {
-    matches!(status, crate::mongo::RsStatus::Active { members, .. } if members.len() >= 3 && members.iter().filter(|m| m.state == 1).count() == 1 && members.iter().all(|m| m.healthy && matches!(m.state, 1 | 2)) && crate::mongo::has_majority(members))
+/// The set is ready for a credential step when every member that still
+/// exists is healthy (PRIMARY or SECONDARY), exactly one of them is the
+/// primary, and the config as a whole still has a majority, so it can commit.
+/// `gone` names the members whose service no longer exists: they stay in the
+/// config until the primary prunes them (`crate::rs`, after the gone dwell),
+/// and a rotation does not wait for that. Nothing is required of the count:
+/// a set running with one member fewer rotates on the members it has.
+fn healthy_set(status: &RsStatus, gone: &HashSet<String>) -> bool {
+    let RsStatus::Active { members, .. } = status else {
+        return false;
+    };
+    let present: Vec<_> = members.iter().filter(|m| !gone.contains(&m.host)).collect();
+    !present.is_empty()
+        && present.iter().filter(|m| m.state == 1).count() == 1
+        && present
+            .iter()
+            .all(|m| m.healthy && matches!(m.state, 1 | 2))
+        && has_majority(members)
+}
+
+/// The members the set cannot reach whose NAME is gone right now (NXDOMAIN:
+/// zero containers registered behind it, which a partition never produces;
+/// see `crate::dns_probe`).
+async fn gone_members(status: &RsStatus) -> HashSet<String> {
+    let mut gone = HashSet::new();
+    if let RsStatus::Active { members, .. } = status {
+        for m in members.iter().filter(|m| !m.healthy && !m.is_self) {
+            let (host, _) = split_host_port(&m.host);
+            if probe_name_detailed(&host, Duration::from_secs(2)).await.0 == NameVerdict::Gone {
+                gone.insert(m.host.clone());
+            }
+        }
+    }
+    gone
+}
+
+/// `healthy_set` on the live status, with the gone members probed.
+async fn set_ready(mongo: &Mongo) -> anyhow::Result<bool> {
+    let status = mongo.rs_status().await?;
+    let gone = gone_members(&status).await;
+    Ok(healthy_set(&status, &gone))
 }
 
 #[derive(Deserialize, Serialize)]
@@ -117,8 +159,7 @@ async fn apply(state: &AppState, request: Rotation) -> anyhow::Result<Value> {
                 "current password refused"
             );
             state.mongo.ping().await?;
-            let status = state.mongo.rs_status().await?;
-            anyhow::ensure!(healthy_set(&status), "cluster not healthy");
+            anyhow::ensure!(set_ready(&state.mongo).await?, "cluster not healthy");
         }
         Operation::Prepare => {
             save_pending(&state.config.data_dir, &request)?;
@@ -177,10 +218,7 @@ async fn apply(state: &AppState, request: Rotation) -> anyhow::Result<Value> {
             )?;
         }
         Operation::KeyStatus => {
-            anyhow::ensure!(
-                healthy_set(&state.mongo.rs_status().await?),
-                "replica set not healthy"
-            );
+            anyhow::ensure!(set_ready(&state.mongo).await?, "replica set not healthy");
         }
         Operation::KeyPrepare | Operation::KeyCommit => {
             anyhow::ensure!(
@@ -197,7 +235,7 @@ async fn apply(state: &AppState, request: Rotation) -> anyhow::Result<Value> {
                 target_keyfile(&request, matches!(request.operation, Operation::KeyPrepare));
             if loaded_keyfile().as_ref() != Some(&target) {
                 anyhow::ensure!(
-                    healthy_set(&state.mongo.rs_status().await?),
+                    set_ready(&state.mongo).await?,
                     "replica set not healthy before restart"
                 );
                 // The pin is durable restart intent. On process/container loss,
@@ -213,11 +251,7 @@ async fn apply(state: &AppState, request: Rotation) -> anyhow::Result<Value> {
             }
             loop {
                 if loaded_keyfile().as_ref() == Some(&target)
-                    && state
-                        .mongo
-                        .rs_status()
-                        .await
-                        .is_ok_and(|status| healthy_set(&status))
+                    && set_ready(&state.mongo).await.unwrap_or(false)
                 {
                     break;
                 }
@@ -236,8 +270,7 @@ async fn apply(state: &AppState, request: Rotation) -> anyhow::Result<Value> {
                     == Some(&target_keyfile(&request, false)),
                 "keyfile pin differs"
             );
-            let status = state.mongo.rs_status().await?;
-            anyhow::ensure!(healthy_set(&status), "cluster not healthy");
+            anyhow::ensure!(set_ready(&state.mongo).await?, "cluster not healthy");
             if request.current_password != request.new_password {
                 anyhow::ensure!(
                     matches!(
@@ -369,6 +402,84 @@ pub async fn reconcile_keyfile_at_boot(config: &crate::config::Config) -> anyhow
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mongo::RsMember;
+
+    fn member(host: &str, state: i32, healthy: bool) -> RsMember {
+        RsMember {
+            id: 0,
+            host: format!("{host}:27017"),
+            state,
+            state_str: String::new(),
+            healthy,
+            is_self: host == "a",
+            optime_secs: None,
+        }
+    }
+    fn active(members: Vec<RsMember>) -> RsStatus {
+        RsStatus::Active {
+            set_name: "rs0".into(),
+            my_state: 1,
+            my_state_str: "PRIMARY".into(),
+            members,
+            voting_members: None,
+        }
+    }
+    fn gone(hosts: &[&str]) -> HashSet<String> {
+        hosts.iter().map(|h| format!("{h}:27017")).collect()
+    }
+
+    #[test]
+    fn set_is_ready_on_the_members_that_exist_whatever_the_count() {
+        let three = || {
+            vec![
+                member("a", 1, true),
+                member("b", 2, true),
+                member("c", 2, true),
+            ]
+        };
+        assert!(healthy_set(&active(three()), &gone(&[])));
+        // A deleted member, pruned already: two members rotate.
+        assert!(healthy_set(
+            &active(vec![member("a", 1, true), member("b", 2, true)]),
+            &gone(&[])
+        ));
+        // A deleted member still in the config, its name gone: ignored, and
+        // the two live members still hold the config's majority.
+        assert!(healthy_set(
+            &active(vec![
+                member("a", 1, true),
+                member("b", 2, true),
+                member("c", 8, false)
+            ]),
+            &gone(&["c"])
+        ));
+        // Unreachable but its name still exists (a crash, a redeploy): waited on.
+        assert!(!healthy_set(
+            &active(vec![
+                member("a", 1, true),
+                member("b", 2, true),
+                member("c", 8, false)
+            ]),
+            &gone(&[])
+        ));
+        // Two of three gone: no majority, nothing can commit.
+        assert!(!healthy_set(
+            &active(vec![
+                member("a", 1, true),
+                member("b", 8, false),
+                member("c", 8, false)
+            ]),
+            &gone(&["b", "c"])
+        ));
+        // No primary, or two, among the members that exist.
+        assert!(!healthy_set(
+            &active(vec![member("a", 2, true), member("b", 2, true)]),
+            &gone(&[])
+        ));
+        assert!(!healthy_set(&active(vec![]), &gone(&[])));
+        assert!(!healthy_set(&RsStatus::NotInitialized, &gone(&[])));
+    }
+
     #[test]
     fn two_pass_keys_overlap_then_revoke_the_original() {
         let request = Rotation {
