@@ -40,7 +40,11 @@
 //!   - A member the set can no longer reach is removed from the config only
 //!     on the same NXDOMAIN proof, by the primary — so a scale-down shrinks
 //!     the majority requirement instead of leaving ghosts that vote against
-//!     every future election.
+//!     every future election. The prune serves its own, shorter dwell
+//!     (`member_prune_dwell_seconds`): a wrong prune is undone by the member
+//!     itself (it comes back REMOVED, re-adds itself through the primary and
+//!     catches up from its own data), while a wrong waiver can initiate past
+//!     the dataset that matters and is never undone.
 
 use crate::config::Config;
 use crate::dns_probe::{probe_name_detailed, NameVerdict};
@@ -508,8 +512,17 @@ pub async fn orchestrate(
                 stable_since = None;
                 match primary_host {
                     Some(primary) => {
-                        match add_self_through_primary(&config, &primary, my_has_data, &telemetry)
-                            .await
+                        // A node this set removed (a prune that outlived its
+                        // redeploy) holds this set's own data: re-adding it
+                        // undoes the prune, and is no join over foreign data.
+                        let holds_foreign_data = my_has_data && !removed;
+                        match add_self_through_primary(
+                            &config,
+                            &primary,
+                            holds_foreign_data,
+                            &telemetry,
+                        )
+                        .await
                         {
                             Ok(_) => last_log.clear(),
                             Err(e) => {
@@ -615,7 +628,7 @@ pub async fn orchestrate(
 async fn member_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemetry>) {
     let mut last_role: Option<String> = None;
     let mut gone = GoneTracker::new();
-    let gone_dwell = Duration::from_secs(config.peer_gone_dwell_seconds);
+    let prune_dwell = Duration::from_secs(config.member_prune_dwell_seconds);
     let mut member_states = MemberStateTracker::new();
     let mut replication_alerts: HashSet<String> = HashSet::new();
     loop {
@@ -656,7 +669,7 @@ async fn member_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemet
                     let _ = mongo.rs_status().await;
                 }
                 if h.is_writable_primary {
-                    prune_round(&config, &mongo, &telemetry, &mut gone, gone_dwell).await;
+                    prune_round(&config, &mongo, &telemetry, &mut gone, prune_dwell).await;
                     replication_health_round(
                         &mongo,
                         &telemetry,
@@ -673,14 +686,17 @@ async fn member_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemet
 }
 
 /// On the primary: any member the set cannot reach whose NAME has been
-/// NXDOMAIN for the whole dwell is removed from the config. Everything short
-/// of that proof (a crash, a partition, a redeploy window) keeps the member.
+/// NXDOMAIN for the whole prune dwell is removed from the config. Everything
+/// short of that proof (a crash, a partition, a redeploy window) keeps the
+/// member. A member pruned while merely mid-redeploy is not lost: it boots
+/// REMOVED, the bootstrap loop re-adds it through the primary, and it
+/// catches up from the data it already holds.
 async fn prune_round(
     config: &Config,
     mongo: &Mongo,
     telemetry: &Telemetry,
     gone: &mut GoneTracker,
-    gone_dwell: Duration,
+    prune_dwell: Duration,
 ) {
     let Ok(RsStatus::Active { members, .. }) = mongo.rs_status().await else {
         return;
@@ -698,7 +714,7 @@ async fn prune_round(
         let (verdict, detail) = probe_name_detailed(&host, Duration::from_secs(2)).await;
         gone.observe(&m.host, verdict, now);
         debug!(member = %m.host, ?verdict, ?detail, "unreachable member probed");
-        if !gone.is_waived(&m.host, now, gone_dwell) {
+        if !gone.is_waived(&m.host, now, prune_dwell) {
             continue;
         }
         let Ok(current) = mongo.rs_config().await else {
@@ -707,7 +723,7 @@ async fn prune_round(
         match config_with_member_removed(&current, &m.host) {
             Ok(next) => match mongo.rs_reconfig(next).await {
                 Ok(()) => {
-                    warn!(member = %m.host, "removed a member whose name has been gone for the whole dwell");
+                    warn!(member = %m.host, dwell_secs = prune_dwell.as_secs(), "removed a member whose name has been gone for the whole dwell");
                     telemetry.send(TelemetryEvent::ComponentError {
                         component: "mongo-wrapper".to_string(),
                         error: format!(
