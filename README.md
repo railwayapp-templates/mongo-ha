@@ -151,10 +151,14 @@ The `mongo-wrapper` binary (one per data node):
   joiner adds itself through the primary with a safe `replSetReconfig`, so
   scale-up never needs the survivors' `RS_SEEDS` restamped.
 - **Membership prune.** On the primary, a member the set cannot reach whose
-  name has been NXDOMAIN for the whole dwell is removed from the config, so a
+  name has been NXDOMAIN for the whole prune dwell
+  (`MEMBER_PRUNE_DWELL_SECONDS`, 5 minutes) is removed from the config, so a
   scale-down shrinks the majority requirement instead of leaving ghosts that
   vote against every future election. Anything short of that proof (a crash,
-  a partition, a redeploy window) keeps the member.
+  a partition, a redeploy window) keeps the member. The prune dwell is
+  shorter than the initiate waiver's on purpose: a member pruned while merely
+  mid-redeploy comes back REMOVED, re-adds itself through the primary and
+  catches up from its own data, whereas a wrong waiver is never undone.
 - **Demote on shutdown.** On SIGTERM a primary runs `replSetStepDown` with a
   catch-up window before mongod is signaled, so a planned redeploy is a
   handoff, not a detection-timeout failover.
@@ -291,7 +295,8 @@ Data node (`mongo-wrapper`):
 | `HEALTH_API_USERNAME` | no | `railway` | Username of that credential (leading/trailing whitespace ignored; blank → `railway`, the same resolution the platform applies) |
 | `RAILWAY_VOLUME_MOUNT_PATH` / `DATA_DIR` | no | `/data/db` | dbpath |
 | `BOOTSTRAP_DWELL_SECONDS` | no | `15` | How long an initiate verdict must hold |
-| `PEER_GONE_DWELL_SECONDS` | no | `1800` | NXDOMAIN proof length for waiver/prune |
+| `PEER_GONE_DWELL_SECONDS` | no | `1800` | NXDOMAIN proof length before the initiate guard stops waiting on a peer |
+| `MEMBER_PRUNE_DWELL_SECONDS` | no | `300` | NXDOMAIN proof length before the primary removes a departed member |
 | `DEMOTE_TIMEOUT_MS` | no | `20000` | Bound on the pre-shutdown step-down |
 
 Extra `mongod` flags may be passed as the container command (CMD); the image

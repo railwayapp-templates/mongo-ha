@@ -93,7 +93,12 @@ ensure_network() {
 # hostname/alias/container name — the deletion scenarios park their nodes
 # under the reserved `.invalid` TLD so a removed container's name resolves as
 # authoritative NXDOMAIN on any resolver (bare names get environment-dependent
-# answers once the container is gone).
+# answers once the container is gone). E2E_DOCKER_DNS, when set, is handed to
+# `docker run --dns`: some Docker hosts (Colima's VM resolver, for one) fold
+# an upstream NXDOMAIN for an AAAA query into NOERROR, and the wrapper's probe
+# asks AAAA — the deletion scenarios then never arm. A public resolver
+# (1.1.1.1) answers NXDOMAIN for `.invalid`, and container aliases still
+# resolve through Docker's embedded DNS in front of it.
 start_node() {
   local n="$1"; shift
   local host="mongo-$n${NODE_SUFFIX:-}"
@@ -101,6 +106,7 @@ start_node() {
   docker volume create --label "$LABEL" "mongo-ha-e2e-vol-$n" >/dev/null
   docker run -d --label "$LABEL" --restart unless-stopped \
     --name "$host" --hostname "$host" \
+    ${E2E_DOCKER_DNS:+--dns "$E2E_DOCKER_DNS"} \
     --network "$NET" --network-alias "$host" \
     -v "mongo-ha-e2e-vol-$n:/data/db" \
     -e MONGO_INITDB_ROOT_USERNAME="$ROOT_USER" \
@@ -818,17 +824,22 @@ t_wiped_member_volume_rejoins_fresh() {
     && ok "rebuilt member holds the set's data" || bad "rebuilt member is missing data"
 }
 
+# start_invalid_trio [extra docker args...] — a fresh trio parked under the
+# reserved .invalid TLD, where a removed container's name resolves NXDOMAIN
+# on any resolver: the deletion proof the prune needs. Only the PRUNE dwell
+# is shortened; the initiate waiver keeps its 30-minute default, so a prune
+# that lands inside a scenario's wait proves it runs on its own clock.
+start_invalid_node() {
+  local n="$1"; shift
+  NODE_SUFFIX=".invalid" SEEDS_OVERRIDE="mongo-1.invalid:27017,mongo-2.invalid:27017,mongo-3.invalid:27017" \
+    start_node "$n" -e MEMBER_PRUNE_DWELL_SECONDS=20 "$@"
+}
+start_invalid_trio() { start_invalid_node 1; start_invalid_node 2; start_invalid_node 3; }
+
 t_deleted_member_is_pruned() {
-  log "t_deleted_member_is_pruned (fresh trio under .invalid, short dwell)"
+  log "t_deleted_member_is_pruned (fresh trio under .invalid, short prune dwell)"
   teardown_trio
-  # Names under the reserved .invalid TLD resolve NXDOMAIN on any resolver
-  # once the container is gone — the deletion proof the prune needs.
-  NODE_SUFFIX=".invalid" SEEDS_OVERRIDE="mongo-1.invalid:27017,mongo-2.invalid:27017,mongo-3.invalid:27017" \
-    start_node 1 -e PEER_GONE_DWELL_SECONDS=20
-  NODE_SUFFIX=".invalid" SEEDS_OVERRIDE="mongo-1.invalid:27017,mongo-2.invalid:27017,mongo-3.invalid:27017" \
-    start_node 2 -e PEER_GONE_DWELL_SECONDS=20
-  NODE_SUFFIX=".invalid" SEEDS_OVERRIDE="mongo-1.invalid:27017,mongo-2.invalid:27017,mongo-3.invalid:27017" \
-    start_node 3 -e PEER_GONE_DWELL_SECONDS=20
+  start_invalid_trio
   wait_until 300 "3 healthy" set_is_fully_online mongo-1.invalid || { bad "no set"; NODE_SUFFIX=".invalid" teardown_trio; return; }
 
   # Delete a secondary for good (container AND volume).
@@ -849,15 +860,66 @@ t_deleted_member_is_pruned() {
   else
     bad "no prune log line"
   fi
+  if node_logged "$primary" '"dwell_secs":20'; then
+    ok "prune served MEMBER_PRUNE_DWELL_SECONDS, not the initiate waiver's dwell"
+  else
+    bad "prune did not report the 20 s prune dwell"
+  fi
+  NODE_SUFFIX=".invalid" teardown_trio
+}
+
+# A member away longer than the prune dwell but not deleted (a slow redeploy,
+# a volume migration) is pruned, and must undo that itself when it comes back
+# on its own volume: it boots REMOVED, re-adds itself through the primary and
+# catches up from the data it already holds — no alarm about foreign data,
+# since the data is this set's own.
+t_pruned_member_redeploy_rejoins_with_data() {
+  log "t_pruned_member_redeploy_rejoins_with_data (fresh trio under .invalid, short prune dwell)"
+  teardown_trio
+  start_invalid_trio
+  wait_until 300 "3 healthy" set_is_fully_online mongo-1.invalid || { bad "no set"; NODE_SUFFIX=".invalid" teardown_trio; return; }
+
+  local primary victim n
+  primary="$(current_primary mongo-2.invalid mongo-1.invalid mongo-2.invalid mongo-3.invalid)"
+  victim="$(printf 'mongo-1.invalid\nmongo-2.invalid\nmongo-3.invalid\n' | grep -v "^$primary$" | head -1)"
+  n="$(echo "$victim" | sed -E 's/^mongo-([0-9]+).*/\1/')"
+  mongo "$primary" 'db.getSiblingDB("t").kv.insertOne({_id: 7, v: "pre-prune"}, {writeConcern: {w: "majority"}})' >/dev/null
+  # The container goes (NXDOMAIN under .invalid); the volume stays.
+  docker rm -f "$victim" >/dev/null
+  log "$victim stopped, volume kept; waiting for the primary to prune it"
+  wait_until 180 "member count drops to 2" \
+    bash -c "[ \"\$(docker exec $primary mongosh --quiet 'mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin?directConnection=true' --eval 'rs.conf().members.length' 2>/dev/null | tr -d '[:space:]')\" = 2 ]" \
+    || { bad "member away past the prune dwell was not pruned"; NODE_SUFFIX=".invalid" teardown_trio; return; }
+  mongo "$primary" 'db.getSiblingDB("t").kv.insertOne({_id: 8, v: "while-pruned"}, {writeConcern: {w: "majority"}})' >/dev/null
+
+  # The "redeploy" lands: same name, same volume.
+  start_invalid_node "$n"
+  wait_until 300 "pruned member back (3 healthy and voting)" set_is_fully_online "$primary" \
+    && ok "pruned member re-added itself after its redeploy" \
+    || { bad "pruned member did not rejoin"; NODE_SUFFIX=".invalid" teardown_trio; return; }
+  if node_logged "$victim" "seeking to be re-added" && node_logged "$victim" "added to the replica set"; then
+    ok "rejoin went through the REMOVED path and a self-add reconfig"
+  else
+    bad "rejoin did not go through the REMOVED self-add path"
+  fi
+  if node_logged "$victim" "initial sync will replace the local data"; then
+    bad "rejoin raised the foreign-data alarm for this set's own data"
+  else
+    ok "no foreign-data alarm on the rejoin"
+  fi
+  wait_until 120 "set's writes on the rejoined member" \
+    bash -c "[ \"\$(docker exec $victim mongosh --quiet 'mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin?directConnection=true' --eval 'db.getSiblingDB(\"t\").kv.find({_id: {\$in: [7, 8]}}).toArray().map(d => d.v).join(\",\")' 2>/dev/null | tr -d '[:space:]')\" = pre-prune,while-pruned ]" \
+    && ok "rejoined member holds the writes from before and during the prune" \
+    || bad "rejoined member is missing writes"
   NODE_SUFFIX=".invalid" teardown_trio
 }
 
 t_paused_member_is_not_pruned() {
-  log "t_paused_member_is_not_pruned (fresh trio, short dwell)"
+  log "t_paused_member_is_not_pruned (fresh trio, short prune dwell)"
   teardown_trio
-  start_node 1 -e PEER_GONE_DWELL_SECONDS=20
-  start_node 2 -e PEER_GONE_DWELL_SECONDS=20
-  start_node 3 -e PEER_GONE_DWELL_SECONDS=20
+  start_node 1 -e MEMBER_PRUNE_DWELL_SECONDS=20
+  start_node 2 -e MEMBER_PRUNE_DWELL_SECONDS=20
+  start_node 3 -e MEMBER_PRUNE_DWELL_SECONDS=20
   wait_until 300 "3 healthy" set_is_fully_online mongo-1 || { bad "no set"; return; }
 
   # A paused container still has its name registered: unreachable, but NOT
@@ -1352,6 +1414,7 @@ ALL_TESTS=(
   t_minority_partition_write_fence
   t_paused_member_is_not_pruned
   t_deleted_member_is_pruned
+  t_pruned_member_redeploy_rejoins_with_data
   t_revert_to_standalone_and_reconvert
   t_revert_after_crash_preserves_unflushed_writes
   t_standalone_boot_completes_fcv

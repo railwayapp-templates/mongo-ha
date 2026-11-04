@@ -80,13 +80,26 @@ pub struct Config {
     /// (see demote_on_shutdown.rs).
     pub demote_timeout_ms: u64,
     /// How long a declared peer's NAME must be authoritatively gone
-    /// (continuous NXDOMAIN) before (a) the initiate guard stops waiting on
-    /// it and (b) the primary removes it from the replica set config. Long
-    /// on purpose: a redeploy passes through a no-container NXDOMAIN window,
-    /// and waiving a peer that was merely mid-redeploy could initiate past
-    /// the dataset that matters. See rs::GoneTracker.
+    /// (continuous NXDOMAIN) before the initiate guard stops waiting on it.
+    /// Long on purpose: a redeploy passes through a no-container NXDOMAIN
+    /// window, and waiving a peer that was merely mid-redeploy could initiate
+    /// past the dataset that matters — a wrong waiver is not undone. See
+    /// rs::GoneTracker.
     pub peer_gone_dwell_seconds: u64,
+    /// How long a member's NAME must be authoritatively gone before the
+    /// primary removes it from the replica set config. Shorter than the
+    /// waiver: a wrong prune is undone by the member itself — it comes back
+    /// REMOVED, re-adds itself through the primary and catches up from its
+    /// own data — while every minute a deleted member stays in the config is
+    /// a minute the set carries a ghost that a second loss turns into no
+    /// majority. Still well above a redeploy's no-container window.
+    pub member_prune_dwell_seconds: u64,
 }
+
+/// NXDOMAIN proof the initiate waiver requires, seconds.
+pub const DEFAULT_PEER_GONE_DWELL_SECONDS: u64 = 1800;
+/// NXDOMAIN proof the membership prune requires, seconds.
+pub const DEFAULT_MEMBER_PRUNE_DWELL_SECONDS: u64 = 300;
 
 impl Config {
     pub fn from_env() -> Result<Self> {
@@ -123,7 +136,14 @@ impl Config {
             peer_query_timeout_ms: u64::env_parse("PEER_QUERY_TIMEOUT_MS", 2000),
             bootstrap_dwell_seconds: u64::env_parse("BOOTSTRAP_DWELL_SECONDS", 15),
             demote_timeout_ms: u64::env_parse("DEMOTE_TIMEOUT_MS", 20_000),
-            peer_gone_dwell_seconds: u64::env_parse("PEER_GONE_DWELL_SECONDS", 1800),
+            peer_gone_dwell_seconds: u64::env_parse(
+                "PEER_GONE_DWELL_SECONDS",
+                DEFAULT_PEER_GONE_DWELL_SECONDS,
+            ),
+            member_prune_dwell_seconds: u64::env_parse(
+                "MEMBER_PRUNE_DWELL_SECONDS",
+                DEFAULT_MEMBER_PRUNE_DWELL_SECONDS,
+            ),
         };
 
         if config.rs_enabled() && config.rs_key.is_none() {
@@ -261,6 +281,7 @@ mod tests {
             bootstrap_dwell_seconds: 15,
             demote_timeout_ms: 20_000,
             peer_gone_dwell_seconds: 1800,
+            member_prune_dwell_seconds: 300,
         }
     }
 
