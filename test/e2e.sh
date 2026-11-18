@@ -1398,6 +1398,310 @@ t_replica_set_raises_fcv_on_the_primary() {
   ok "no secondary raised FCV"
 }
 
+# ---------------------------------------------------------------------------
+# Fresh-deploy start order. A first deploy brings the three data nodes up in
+# whatever order the platform schedules them; the set must form exactly once,
+# initiated by the seed-order winner (mongo-1), whichever node comes up first.
+# These scenarios run nodes in the TEMPLATE's shape (backboard
+# scripts/seed-mongo-ha-template.ts), not start_node's: no dwell override
+# (BOOTSTRAP_DWELL_SECONDS is unset there, so the image default of 15 s
+# applies), RS_KEY and HEALTH_API_PASSWORD referencing the root password,
+# RS_ENABLED stamped, restart policy ALWAYS.
+
+# start_template_node <n> [extra docker args...] — mongo-N as the template
+# stamps it, on the same volume name start_node uses (teardown_trio reaps it).
+start_template_node() {
+  local n="$1"; shift
+  local host="mongo-$n"
+  docker volume create --label "$LABEL" "mongo-ha-e2e-vol-$n" >/dev/null
+  docker run -d --label "$LABEL" --restart always \
+    --name "$host" --hostname "$host" \
+    ${E2E_DOCKER_DNS:+--dns "$E2E_DOCKER_DNS"} \
+    --network "$NET" --network-alias "$host" \
+    -v "mongo-ha-e2e-vol-$n:/data/db" \
+    -e MONGO_INITDB_ROOT_USERNAME="$ROOT_USER" \
+    -e MONGO_INITDB_ROOT_PASSWORD="$ROOT_PW" \
+    -e RS_KEY="$ROOT_PW" \
+    -e RS_ENABLED=true \
+    -e RS_SEEDS="$SEEDS" \
+    -e RS_NAME="$RS_NAME" \
+    -e MONGO_PORT=27017 \
+    -e HEALTH_PORT=8080 \
+    -e HEALTH_API_PASSWORD="$ROOT_PW" \
+    -e MONGOHOST="$host" \
+    -e MONGOPORT=27017 \
+    -e MONGOUSER="$ROOT_USER" \
+    -e MONGOPASSWORD="$ROOT_PW" \
+    -e MONGO_URL="mongodb://$ROOT_USER:$ROOT_PW@$host:27017" \
+    -e RAILWAY_PRIVATE_DOMAIN="$host" \
+    -e RAILWAY_ENVIRONMENT_ID="e2e-env" \
+    -e RAILWAY_VOLUME_MOUNT_PATH="/data/db" \
+    "$@" \
+    "$IMAGE" >/dev/null
+}
+
+# hold_name <host> — a container that owns <host>'s network alias and runs
+# nothing: the name resolves, every port refuses. The shape of a service whose
+# container is registered but whose wrapper is not serving yet (image pull,
+# slow boot, a hung entrypoint). The wrapper image itself with `sleep` as the
+# entrypoint, so no other image has to be pulled.
+hold_name() {
+  docker rm -f "$1-placeholder" >/dev/null 2>&1
+  docker run -d --label "$LABEL" --name "$1-placeholder" --hostname "$1" \
+    --network "$NET" --network-alias "$1" \
+    --entrypoint sleep "$IMAGE" infinity >/dev/null
+}
+release_name() { docker rm -f "$1-placeholder" >/dev/null 2>&1; }
+
+teardown_start_order() { release_name mongo-1; teardown_trio; }
+
+# name_resolves_from <probe> <host> — the probe container's resolver answers
+# for <host>.
+name_resolves_from() { docker exec "$1" getent hosts "$2" >/dev/null 2>&1; }
+
+# answers_no_set <probe> <node> — the node's FINAL mongod is up (its
+# /rs/state answers 200 at all) and it holds no replica set.
+answers_no_set() { rs_state_json "$1" "$2" | grep -qF '"set_active":false'; }
+
+# all_answer_no_set <nodes...> — answers_no_set for each node, probed from itself.
+all_answer_no_set() {
+  local n
+  for n in "$@"; do answers_no_set "$n" "$n" || return 1; done
+}
+
+# no_set_anywhere <nodes...> — no listed node logged an initiate, reports a
+# set on /rs/state, or answers /role 200 (each probed from itself).
+no_set_anywhere() {
+  local n
+  for n in "$@"; do
+    if node_logged "$n" "initiating a new replica set"; then log "$n logged an initiate"; return 1; fi
+    if rs_state_json "$n" "$n" | grep -qF '"set_active":true'; then log "$n reports a set on /rs/state"; return 1; fi
+    if [ "$(role_code "$n" "$n")" = 200 ]; then log "$n answers /role 200"; return 1; fi
+  done
+  return 0
+}
+
+# hold_no_set <seconds> <nodes...> — no_set_anywhere sampled every 3 s for
+# the whole window; fails on the first sample that sees a set.
+hold_no_set() {
+  local secs="$1"; shift
+  local waited=0
+  while [ "$waited" -lt "$secs" ]; do
+    no_set_anywhere "$@" || return 1
+    sleep 3
+    waited=$((waited+3))
+  done
+  no_set_anywhere "$@"
+}
+
+# set_identity <node> — "set|configVersion|replicaSetId" as the node's own
+# mongod reports it (ERR before it holds a config).
+set_identity() {
+  mongo "$1" 'try { const s = rs.status(), c = rs.conf(); print(s.set + "|" + c.version + "|" + c.settings.replicaSetId.toString()) } catch (e) { print("ERR") }' | tail -1 | tr -d '[:space:]'
+}
+
+# same_set_identity <nodes...> — every node reports the same set name, config
+# version and replicaSetId, and the set is RS_NAME.
+same_set_identity() {
+  local first n id
+  first="$(set_identity "$1")"
+  case "$first" in "$RS_NAME|"*) ;; *) return 1 ;; esac
+  for n in "$@"; do
+    id="$(set_identity "$n")"
+    [ "$id" = "$first" ] || return 1
+  done
+}
+
+# one_primary_two_secondaries — mongod's own myState on each node: exactly one
+# PRIMARY (1) and two SECONDARY (2).
+one_primary_two_secondaries() {
+  local n s p=0 sec=0
+  for n in mongo-1 mongo-2 mongo-3; do
+    s="$(my_state "$n")"
+    [ "$s" = 1 ] && p=$((p+1))
+    [ "$s" = 2 ] && sec=$((sec+1))
+  done
+  [ "$p" = 1 ] && [ "$sec" = 2 ]
+}
+
+# assert_fresh_set_formed <initiator> <canary-id> — the end state every
+# start order must reach: one set, initiated by <initiator> and nobody else,
+# 3 healthy voting members (1 PRIMARY + 2 SECONDARY) sharing one config, and a
+# majority write on the primary readable on both secondaries. Returns 1 when
+# a later assertion has nothing to stand on.
+assert_fresh_set_formed() {
+  local initiator="$1" canary="$2"
+  local n primary secondaries
+
+  wait_until 360 "3 healthy voting members" set_is_fully_online "$initiator" \
+    || { bad "set never formed with 3 healthy voting members"; return 1; }
+  ok "set formed: 3 healthy voting members"
+  wait_until 90 "every member's /rs/state settled" all_rs_state_settled mongo-2 mongo-1 mongo-2 mongo-3 \
+    && ok "every member's wrapper answers /rs/state as PRIMARY or SECONDARY" \
+    || bad "a member's wrapper never reached a settled /rs/state"
+
+  if node_logged "$initiator" "initiating a new replica set"; then
+    ok "$initiator initiated the set"
+  else
+    bad "$initiator never logged 'initiating a new replica set'"
+  fi
+  local initiators=""
+  for n in mongo-1 mongo-2 mongo-3; do
+    node_logged "$n" "initiating a new replica set" && initiators="$initiators $n"
+  done
+  if [ "$initiators" = " $initiator" ]; then
+    ok "exactly one initiator ($initiator)"
+  else
+    bad "initiators were:${initiators:- none} (want exactly $initiator)"
+  fi
+
+  wait_until 90 "1 PRIMARY + 2 SECONDARY" one_primary_two_secondaries \
+    && ok "1 PRIMARY + 2 SECONDARY (states $(my_state mongo-1)/$(my_state mongo-2)/$(my_state mongo-3))" \
+    || bad "states are $(my_state mongo-1)/$(my_state mongo-2)/$(my_state mongo-3), want one 1 and two 2"
+  wait_until 60 "exactly one /role 200" exactly_one_primary mongo-2 mongo-1 mongo-2 mongo-3 \
+    && ok "/role fence: exactly one primary" || bad "not exactly one /role 200"
+  wait_until 90 "one set name, config version and replicaSetId everywhere" same_set_identity mongo-1 mongo-2 mongo-3 \
+    && ok "one set everywhere: $(set_identity mongo-1)" \
+    || bad "set identity differs: mongo-1=$(set_identity mongo-1) mongo-2=$(set_identity mongo-2) mongo-3=$(set_identity mongo-3)"
+
+  primary="$(current_primary mongo-2 mongo-1 mongo-2 mongo-3)" || { bad "no primary to write on"; return 1; }
+  mongo "$primary" "db.getSiblingDB(\"t\").kv.replaceOne({_id: \"$canary\"}, {_id: \"$canary\", v: \"fresh-start\"}, {upsert: true, writeConcern: {w: \"majority\"}})" | grep -q acknowledged \
+    || { bad "majority write on $primary was not acknowledged"; return 1; }
+  secondaries="$(printf 'mongo-1\nmongo-2\nmongo-3\n' | grep -v "^$primary$" | tr '\n' ' ')"
+  for n in $secondaries; do
+    wait_until 60 "canary readable on $n" \
+      bash -c "[ \"\$(docker exec $n mongosh --quiet 'mongodb://$ROOT_USER:$ROOT_PW@127.0.0.1:27017/admin?directConnection=true' --eval 'db.getSiblingDB(\"t\").kv.findOne({_id: \"$canary\"}).v' 2>/dev/null)\" = fresh-start ]" \
+      && ok "write on $primary readable on secondary $n" || bad "write on $primary not readable on $n"
+  done
+}
+
+# The seed-order winner is the LAST node to come up, and its name already
+# resolves while the other two run (the platform registered the container,
+# its wrapper is not serving yet). The two early nodes must not form anything
+# past the bootstrap dwell — mongo-1 may hold the set or the data — and the
+# set forms once mongo-1 serves, initiated by mongo-1.
+t_fresh_deploy_seed_started_last_initiates() {
+  log "t_fresh_deploy_seed_started_last_initiates (template env, empty volumes)"
+  teardown_start_order
+  _fresh_deploy_seed_started_last_initiates
+  teardown_start_order
+}
+_fresh_deploy_seed_started_last_initiates() {
+  hold_name mongo-1
+  start_template_node 2
+  start_template_node 3
+  wait_until 180 "mongo-2 and mongo-3 serve /rs/state with no set" \
+    all_answer_no_set mongo-2 mongo-3 \
+    || { bad "mongo-2/mongo-3 never reached their final mongod"; return; }
+  name_resolves_from mongo-2 mongo-1 \
+    && ok "mongo-1's name resolves while its wrapper is not serving" \
+    || bad "the placeholder did not make mongo-1 resolve from mongo-2"
+
+  # Longer than the template's 15 s bootstrap dwell, counted from the moment
+  # both early nodes already answer.
+  if hold_no_set 30 mongo-2 mongo-3; then
+    ok "no set, no initiate, no primary on mongo-2/mongo-3 for 30 s past readiness (dwell is 15 s)"
+  else
+    bad "a replica set formed while the seed winner mongo-1 was not serving"
+    return
+  fi
+
+  release_name mongo-1
+  start_template_node 1
+  assert_fresh_set_formed mongo-1 seed-last
+}
+
+# All three data nodes start at once, the shape of a template deploy.
+t_fresh_deploy_simultaneous_start_one_initiator() {
+  log "t_fresh_deploy_simultaneous_start_one_initiator (template env, empty volumes)"
+  teardown_start_order
+  start_template_node 1 &
+  start_template_node 2 &
+  start_template_node 3 &
+  wait
+  assert_fresh_set_formed mongo-1 simultaneous
+  teardown_start_order
+}
+
+# Contract: a declared peer whose name RESOLVES but whose wrapper never
+# answers /rs/state blocks initiation indefinitely — it may hold the set or
+# the data, and only an authoritative NXDOMAIN for PEER_GONE_DWELL_SECONDS
+# (30 min default) waives it. Bounded here to 90 s at the template's dwell:
+# nobody initiates, nobody is primary, and the waiting nodes say who they are
+# waiting on. Once the real seed serves, the set forms as on any deploy.
+t_initiate_waits_on_a_resolving_unready_peer() {
+  log "t_initiate_waits_on_a_resolving_unready_peer (template env, empty volumes)"
+  teardown_start_order
+  _initiate_waits_on_a_resolving_unready_peer
+  teardown_start_order
+}
+_initiate_waits_on_a_resolving_unready_peer() {
+  hold_name mongo-1
+  start_template_node 2
+  start_template_node 3
+  wait_until 180 "mongo-2 and mongo-3 serve /rs/state with no set" \
+    all_answer_no_set mongo-2 mongo-3 \
+    || { bad "mongo-2/mongo-3 never reached their final mongod"; return; }
+  name_resolves_from mongo-3 mongo-1 \
+    && ok "mongo-1's name resolves" || bad "the placeholder did not make mongo-1 resolve from mongo-3"
+  local code
+  code="$(http_code mongo-2 http://mongo-1:8080/rs/state --tries=1 --timeout=3)"
+  [ "$code" = 000 ] && ok "mongo-1's /rs/state answers nothing (the unready peer)" \
+    || bad "the placeholder answered /rs/state with $code"
+
+  if hold_no_set 90 mongo-2 mongo-3; then
+    ok "no set, no initiate, no primary for 90 s while mongo-1 resolves but does not answer"
+  else
+    bad "a set formed past a declared peer that resolves but never answered"
+    return
+  fi
+  local n
+  for n in mongo-2 mongo-3; do
+    if docker logs "$n" 2>&1 | grep -F "no initiate decision until they do" | grep -qF "mongo-1"; then
+      ok "$n logged that it waits on mongo-1 ('peers not answering yet')"
+    else
+      bad "$n never logged which peer it waits on"
+    fi
+  done
+
+  release_name mongo-1
+  start_template_node 1
+  assert_fresh_set_formed mongo-1 unready-peer
+}
+
+# A fresh replica that restarts before any set exists (a crash, an OOM, a
+# platform restart while the seed is still pulling its image) comes back to
+# a data dir the upstream entrypoint already initialized. It is still a fresh
+# node holding no user data: it must not outrank the seed-order winner, which
+# initiates as on any fresh deploy; the restarted node joins as a SECONDARY.
+t_restarted_fresh_replica_does_not_outrank_seed() {
+  log "t_restarted_fresh_replica_does_not_outrank_seed (template env, empty volumes)"
+  teardown_start_order
+  _restarted_fresh_replica_does_not_outrank_seed
+  teardown_start_order
+}
+_restarted_fresh_replica_does_not_outrank_seed() {
+  start_template_node 3
+  wait_until 180 "mongo-3 serves /rs/state with no set" answers_no_set mongo-3 mongo-3 \
+    || { bad "mongo-3 never reached its final mongod"; return; }
+  log "mongo-3 first boot: $(rs_state_json mongo-3 mongo-3 | grep -oE '"has_data":(true|false)')"
+
+  docker restart -t 60 mongo-3 >/dev/null
+  wait_until 180 "mongo-3 serves /rs/state again after the restart" answers_no_set mongo-3 mongo-3 \
+    || { bad "mongo-3 did not come back after the restart"; return; }
+  ok "mongo-3 restarted before any set existed and serves again with no set"
+  log "mongo-3 second boot: $(rs_state_json mongo-3 mongo-3 | grep -oE '"has_data":(true|false)')"
+
+  start_template_node 1
+  start_template_node 2
+  assert_fresh_set_formed mongo-1 restarted-replica
+  if [ "$(my_state mongo-3)" = 2 ]; then
+    ok "the restarted fresh replica joined as SECONDARY"
+  else
+    bad "the restarted fresh replica is in state $(my_state mongo-3), want 2 (SECONDARY)"
+  fi
+}
+
 ALL_TESTS=(
   t_set_forms_and_replicates
   t_edge_routes_writes_and_authenticates_stats
@@ -1422,6 +1726,10 @@ ALL_TESTS=(
   t_password_variable_edit_does_not_rotate
   t_fresh_member_adopts_live_keyfile
   t_missing_rs_key_refuses_boot
+  t_fresh_deploy_seed_started_last_initiates
+  t_fresh_deploy_simultaneous_start_one_initiator
+  t_initiate_waits_on_a_resolving_unready_peer
+  t_restarted_fresh_replica_does_not_outrank_seed
 )
 
 main() {
