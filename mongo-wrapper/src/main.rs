@@ -111,10 +111,13 @@ async fn main() -> Result<()> {
 
     // Decided before anything spawns: a data dir that already holds a mongod
     // dataset is an adopted volume (or a returning member) and outranks fresh
-    // nodes in the initiate tie-break. Asking the running server instead is
-    // impossible on a not-yet-initiated replica set member (reads refused).
-    let has_data = config.datadir_is_initialized();
-    info!(has_data, "data directory inspected");
+    // nodes in the initiate tie-break — unless this wrapper recorded that the
+    // volume started empty under HA and has joined no set since (see
+    // rs::has_data_at_boot). Asking the running server instead is impossible
+    // on a not-yet-initiated replica set member (reads refused).
+    let datadir_initialized = config.datadir_is_initialized();
+    let has_data = rs::has_data_at_boot(&config.data_dir, datadir_initialized, config.rs_enabled());
+    info!(datadir_initialized, has_data, "data directory inspected");
 
     // Credentials for this boot: the volume's pin outranks the environment
     // (see auth_pin.rs). A node with no pin that finds a live set among its
@@ -302,7 +305,7 @@ async fn main() -> Result<()> {
     // If our private name still resolves to an old container (or NXDOMAIN),
     // mongod rejects its own member identity and cannot elect a primary.
     // Keep the health server available while registration catches up.
-    if config.rs_enabled() && has_data {
+    if config.rs_enabled() && datadir_initialized {
         startup_dns::wait_for_local_address(&config.private_domain).await?;
     }
     let child = process_manager::spawn_mongod(&flags, &args).await?;

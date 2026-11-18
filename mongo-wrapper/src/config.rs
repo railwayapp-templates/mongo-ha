@@ -173,9 +173,10 @@ impl Config {
 
     /// The upstream entrypoint's own "already initialized" test: any of the
     /// files a mongod dataset always carries. Checked BEFORE mongod spawns —
-    /// it is the initiate tie-break's `has_data` (an adopted volume outranks
-    /// fresh nodes), and it cannot be asked of a `--replSet` member with no
-    /// config, which refuses every read command.
+    /// it feeds the initiate tie-break's `has_data` (an adopted volume
+    /// outranks fresh nodes, see `rs::has_data_at_boot`), and it cannot be
+    /// asked of a `--replSet` member with no config, which refuses every read
+    /// command.
     pub fn datadir_is_initialized(&self) -> bool {
         let dir = std::path::Path::new(&self.data_dir);
         ["WiredTiger", "journal", "local.0", "storage.bson"]
