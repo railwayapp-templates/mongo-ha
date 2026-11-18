@@ -95,9 +95,9 @@ pub async fn wait_for_final_mongod(mongo: &Mongo, config: &Config) -> Hello {
 
 /// This node's own /rs/state answer, computed live.
 ///
-/// `has_data` is decided BEFORE mongod spawns (see main.rs): whether the data
-/// dir already held an initialized mongod dataset when this container
-/// started. It cannot be read from the running server: a `--replSet` member
+/// `has_data` is decided BEFORE mongod spawns (see `has_data_at_boot`):
+/// whether the data dir already held a dataset worth keeping when this
+/// container started. It cannot be read from the running server: a `--replSet` member
 /// with no config yet refuses every read command ("node is not in primary or
 /// recovering state"), so a `listDatabases`-based answer would keep
 /// `/rs/state` at 503 on every fresh node and freeze the whole initiate
@@ -204,6 +204,58 @@ impl GoneTracker {
         self.gone_since
             .get(host)
             .is_some_and(|since| now.duration_since(*since) >= dwell)
+    }
+}
+
+/// Written in the data dir by the HA boot that finds it without a mongod
+/// dataset, and removed once this node holds a replica set config: while it
+/// is there, every file in the data dir came from mongod's own first-boot
+/// initialization on a node that has joined no set.
+pub const BORN_EMPTY_MARKER: &str = ".railway-mongo-born-empty";
+
+fn born_empty_marker_path(data_dir: &str) -> std::path::PathBuf {
+    std::path::Path::new(data_dir).join(BORN_EMPTY_MARKER)
+}
+
+/// The initiate tie-break's `has_data` for this boot, decided before mongod
+/// spawns. `datadir_initialized`: the data dir holds a mongod dataset.
+///
+/// HA boot on a data dir with no dataset: records BORN_EMPTY_MARKER and
+/// answers false. HA boot on an initialized data dir: true when the marker is
+/// absent (an adopted standalone volume, or a member of a set), false while
+/// it is present (a fresh node restarted before any set took it in).
+/// Standalone boot: removes the marker — whatever this mongod is given from
+/// here on is user data — and answers `datadir_initialized`.
+pub fn has_data_at_boot(data_dir: &str, datadir_initialized: bool, rs_enabled: bool) -> bool {
+    if !rs_enabled {
+        clear_born_empty_marker(data_dir);
+        return datadir_initialized;
+    }
+    let path = born_empty_marker_path(data_dir);
+    if !datadir_initialized {
+        if let Err(e) = std::fs::write(&path, "") {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "could not record that this data dir started empty; after a restart this node \
+                 ranks as holding data in the initiate tie-break"
+            );
+        }
+        return false;
+    }
+    !path.exists()
+}
+
+/// Remove BORN_EMPTY_MARKER: the data dir now holds more than mongod's own
+/// first-boot files (a replica set config, or a standalone's writes).
+pub fn clear_born_empty_marker(data_dir: &str) {
+    let path = born_empty_marker_path(data_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => info!(path = %path.display(), "born-empty record cleared"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(path = %path.display(), error = %e, "could not clear the born-empty record")
+        }
     }
 }
 
@@ -457,6 +509,11 @@ pub async fn orchestrate(
                 continue;
             }
         };
+        // Any replica set config on this node — current, or one that dropped
+        // it — makes its data dir a set member's from here on.
+        if !matches!(status, RsStatus::NotInitialized) {
+            clear_born_empty_marker(&config.data_dir);
+        }
         let removed = match &status {
             RsStatus::NotInitialized => false,
             // The node holds a config that does not list it — a peer
@@ -876,6 +933,94 @@ fn wait_log_once(last: &mut String, reason: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scratch data dir, and the boot-time `has_data` of a boot on it.
+    struct DataDir(std::path::PathBuf);
+
+    impl DataDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("mongo-born-empty-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        /// What mongod's first start leaves behind.
+        fn mongod_initializes(&self) {
+            std::fs::write(self.0.join("WiredTiger"), "").unwrap();
+        }
+
+        fn boot(&self, rs_enabled: bool) -> bool {
+            let initialized = self.0.join("WiredTiger").exists();
+            has_data_at_boot(self.0.to_str().unwrap(), initialized, rs_enabled)
+        }
+
+        fn marker(&self) -> bool {
+            self.0.join(BORN_EMPTY_MARKER).exists()
+        }
+    }
+
+    impl Drop for DataDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn fresh_node_restarted_before_any_set_holds_no_data() {
+        let dir = DataDir::new("restarted");
+        assert!(!dir.boot(true));
+        dir.mongod_initializes();
+        assert!(!dir.boot(true));
+        assert!(!dir.boot(true));
+        // Seed order decides between it and an equally fresh seed.
+        let peers = vec![("mongo-1".to_string(), Some(0), no_set(false))];
+        assert_eq!(
+            decide(dir.boot(true), Some(2), &peers),
+            Verdict::DeferTo("mongo-1".to_string())
+        );
+    }
+
+    #[test]
+    fn adopted_standalone_volume_holds_data() {
+        let dir = DataDir::new("adopted");
+        assert!(!dir.boot(false));
+        assert!(!dir.marker());
+        dir.mongod_initializes();
+        assert!(dir.boot(false));
+        assert!(dir.boot(true));
+        assert!(dir.boot(true));
+    }
+
+    #[test]
+    fn former_set_member_holds_data() {
+        let dir = DataDir::new("member");
+        assert!(!dir.boot(true));
+        dir.mongod_initializes();
+        // The orchestrator's step on seeing a replica set config.
+        clear_born_empty_marker(dir.0.to_str().unwrap());
+        assert!(dir.boot(true));
+    }
+
+    #[test]
+    fn standalone_boot_ends_the_born_empty_record() {
+        let dir = DataDir::new("reverted");
+        assert!(!dir.boot(true));
+        dir.mongod_initializes();
+        assert!(!dir.boot(true));
+        assert!(dir.boot(false));
+        assert!(dir.boot(true));
+    }
+
+    #[test]
+    fn ha_boot_that_died_before_mongod_initialized_stays_born_empty() {
+        let dir = DataDir::new("died-early");
+        assert!(!dir.boot(true));
+        assert!(!dir.boot(true));
+        dir.mongod_initializes();
+        assert!(!dir.boot(true));
+    }
 
     fn no_set(has_data: bool) -> PeerStanding {
         PeerStanding::NoSet { has_data }
