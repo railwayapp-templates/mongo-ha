@@ -492,6 +492,26 @@ pub async fn orchestrate(
         "mongod is answering"
     );
 
+    // A member pruned while it was away can boot on its own stale config,
+    // which still lists it: it answers SECONDARY until the first heartbeat
+    // delivers the set's config and turns it REMOVED. Member duties hand
+    // such a node back to the join loop instead of keeping it out for good.
+    loop {
+        join_set(&config, &mongo, &telemetry, my_has_data).await;
+        member_duties(config.clone(), mongo.clone(), telemetry.clone()).await;
+        warn!("this node was removed from the set's config; seeking to be re-added");
+    }
+}
+
+/// Polls until this node is a member of the set (any state but REMOVED):
+/// re-adds it through the primary when the set dropped it, joins a set its
+/// peers hold, or initiates one when it is safe to.
+async fn join_set(
+    config: &Arc<Config>,
+    mongo: &Mongo,
+    telemetry: &Arc<Telemetry>,
+    my_has_data: bool,
+) {
     let http = reqwest::Client::new();
     let peer_hosts = config.peer_hosts();
     let dwell = Duration::from_secs(config.bootstrap_dwell_seconds);
@@ -542,7 +562,7 @@ pub async fn orchestrate(
             }
         };
 
-        let answers = query_peers(&http, &config, &peer_hosts).await;
+        let answers = query_peers(&http, config, &peer_hosts).await;
         let now = Instant::now();
         let mut peers = Vec::with_capacity(answers.len());
         for (host, answer) in &answers {
@@ -574,10 +594,10 @@ pub async fn orchestrate(
                         // undoes the prune, and is no join over foreign data.
                         let holds_foreign_data = my_has_data && !removed;
                         match add_self_through_primary(
-                            &config,
+                            config,
                             &primary,
                             holds_foreign_data,
-                            &telemetry,
+                            telemetry,
                         )
                         .await
                         {
@@ -676,12 +696,20 @@ pub async fn orchestrate(
 
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-
-    member_duties(config, mongo, telemetry).await;
 }
 
-/// Runs for the rest of the process: role-change telemetry, and — while this
+/// Whether the set's config no longer lists this node.
+fn removed_from_set(status: &RsStatus) -> bool {
+    match status {
+        RsStatus::NotAMember => true,
+        RsStatus::Active { my_state, .. } => *my_state == STATE_REMOVED,
+        RsStatus::NotInitialized => false,
+    }
+}
+
+/// Runs while this node is a member: role-change telemetry, and — while this
 /// node is the primary — removal of members whose names are provably gone.
+/// Returns when the set's config stops listing this node.
 async fn member_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemetry>) {
     let mut last_role: Option<String> = None;
     let mut gone = GoneTracker::new();
@@ -723,7 +751,13 @@ async fn member_duties(config: Arc<Config>, mongo: Mongo, telemetry: Arc<Telemet
                     // authenticated read per tick lets the client recover
                     // here, before this node is elected and its /role
                     // matters (the primary's rounds below read it already).
-                    let _ = mongo.rs_status().await;
+                    if mongo
+                        .rs_status()
+                        .await
+                        .is_ok_and(|status| removed_from_set(&status))
+                    {
+                        return;
+                    }
                 }
                 if h.is_writable_primary {
                     prune_round(&config, &mongo, &telemetry, &mut gone, prune_dwell).await;
