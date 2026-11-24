@@ -354,9 +354,12 @@ pub async fn resolver(
 }
 
 /// Peer operations must use the same live credential as the local pool.
+/// A member that missed a rotation presents the password the set proved it
+/// runs with (see rotated_password).
 pub fn active_password(config: &crate::config::Config) -> String {
-    read_pin(&config.data_dir)
-        .map(|p| p.password)
+    let pin = read_pin(&config.data_dir).map(|p| p.password);
+    crate::rotated_password::adopted_over_pin(pin.as_deref())
+        .or(pin)
         .unwrap_or_else(|| config.mongo_root_password.clone())
 }
 

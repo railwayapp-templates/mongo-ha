@@ -914,6 +914,181 @@ t_pruned_member_redeploy_rejoins_with_data() {
   NODE_SUFFIX=".invalid" teardown_trio
 }
 
+# ----- a member that was away while the set rotated its password ------------
+#
+# The control plane rotates credentials on the members that are running:
+# `POST /credentials/rotate` on each, in order (preflight, prepare, the user
+# change on the primary, the member step, two rolling keyfile passes with the
+# primary last, then the verification). A member whose container was not
+# running takes part in no step. Its volume still pins the previous password
+# and keyfile, and it comes back with MONGO_INITDB_ROOT_PASSWORD and RS_KEY
+# (a reference to it, on the template) already on the new password. It has to
+# rejoin on its own, without anyone redeploying it again.
+
+# rotate_call <container> <operation> <new> <current> <request password>
+rotate_call() {
+  docker exec "$1" wget -q -S -O /dev/null -T 60 \
+    --header "Authorization: Basic $(printf 'railway:%s' "$5" | base64 | tr -d '\n')" \
+    --header 'Content-Type: application/json' \
+    --post-data "{\"operation\":\"$2\",\"newPassword\":\"$3\",\"currentPassword\":\"$4\"}" \
+    http://127.0.0.1:8080/credentials/rotate 2>&1 | awk '/^  HTTP\//{code=$2} END{print code+0}'
+}
+
+# rotate_step <operation> <new> <current> <member>... — the members in order,
+# each asked for three minutes with the previous password and then the new
+# one: a keyfile pass restarts mongod, and the set re-elects meanwhile.
+rotate_step() {
+  local op="$1" new="$2" current="$3"; shift 3
+  local m code auth deadline
+  for m in "$@"; do
+    deadline=$(($(date +%s) + 180)); code=""
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      for auth in "$current" "$new"; do
+        code="$(rotate_call "$m" "$op" "$new" "$current" "$auth")"
+        [ "$code" = "200" ] && break 2
+      done
+      sleep 3
+    done
+    [ "$code" = "200" ] || { echo "$op on $m answered $code"; return 1; }
+  done
+}
+
+# secondaries_then_primary <probe> <member>... — the members with the current
+# primary last, the order every keyfile pass restarts them in.
+secondaries_then_primary() {
+  local probe="$1"; shift
+  local primary n ordered=()
+  primary="$(current_primary "$probe" "$@")" || return 1
+  for n in "$@"; do [ "$n" != "$primary" ] && ordered+=("$n"); done
+  echo "${ordered[*]} $primary"
+}
+
+# rotate_set_password <current> <new> <member>...
+rotate_set_password() {
+  local current="$1" new="$2"; shift 2
+  local primary pass order
+  rotate_step preflight "$current" "$current" "$@" || return 1
+  rotate_step prepare "$new" "$current" "$@" || return 1
+  primary="$(current_primary "$1" "$@")" || { echo "no primary"; return 1; }
+  rotate_step database "$new" "$current" "$primary" || return 1
+  rotate_step member "$new" "$current" "$@" || return 1
+  for pass in key_prepare key_commit; do
+    wait_until 120 "a primary before $pass" exactly_one_primary "$1" "$@" || { echo "no primary before $pass"; return 1; }
+    order="$(secondaries_then_primary "$1" "$@")" || { echo "no primary before $pass"; return 1; }
+    # shellcheck disable=SC2086
+    rotate_step "$pass" "$new" "$current" $order || return 1
+  done
+  rotate_step verify "$new" "$current" "$@" || return 1
+}
+
+# root_login_ok <probe> <target> <password> — a root login to <target> over
+# the network, from another member.
+root_login_ok() {
+  docker exec "$1" mongosh --quiet \
+    "mongodb://$ROOT_USER:$3@$2:27017/admin?directConnection=true&authSource=admin" \
+    --eval 'print(db.runCommand({ping: 1}).ok)' 2>/dev/null | tr -d '[:space:]' | grep -qx 1
+}
+
+# run_returning_member_case <pruned|kept|peers-paused>
+#   pruned:       away past the prune dwell; the primary removes it from the
+#                 config, and it has to re-add itself.
+#   kept:         still in the config when it comes back.
+#   peers-paused: still in the config, and no peer answers when it boots;
+#                 they come back a minute later.
+run_returning_member_case() {
+  local mode="$1"
+  local real_root="$ROOT_PW" old="$ROOT_PW" new="rotated-while-away"
+  local dwell=20
+  [ "$mode" = "pruned" ] || dwell=3600
+  NODE_SUFFIX=".invalid" teardown_trio
+  local n
+  for n in 1 2 3; do
+    start_invalid_node "$n" -e RS_KEY="$old" -e MEMBER_PRUNE_DWELL_SECONDS="$dwell"
+  done
+  wait_until 300 "3 healthy" set_is_fully_online mongo-1.invalid \
+    || { bad "no set"; NODE_SUFFIX=".invalid" teardown_trio; return; }
+
+  local all=(mongo-1.invalid mongo-2.invalid mongo-3.invalid) primary away stay reachable=()
+  primary="$(current_primary mongo-2.invalid "${all[@]}")"
+  for away in "${all[@]}"; do [ "$away" != "$primary" ] && break; done
+  for n in "${all[@]}"; do [ "$n" != "$away" ] && reachable+=("$n"); done
+  stay="${reachable[0]}"
+  mongo "$primary" 'db.getSiblingDB("t").kv.insertOne({_id: 30, v: "before"}, {writeConcern: {w: "majority"}})' >/dev/null
+
+  log "removing $away's container (its volume stays); rotating on ${reachable[*]}"
+  docker rm -f "$away" >/dev/null
+  if [ "$mode" = "pruned" ]; then
+    wait_until 180 "the primary prunes $away" \
+      bash -c "[ \"\$(docker exec $primary mongosh --quiet 'mongodb://$ROOT_USER:$old@127.0.0.1:27017/admin?directConnection=true' --eval 'rs.conf().members.length' 2>/dev/null | tr -d '[:space:]')\" = 2 ]" \
+      || { bad "$away was not pruned"; NODE_SUFFIX=".invalid" teardown_trio; return; }
+  fi
+  local refusal
+  if ! refusal="$(rotate_set_password "$old" "$new" "${reachable[@]}")"; then
+    bad "the rotation on the running members did not complete: $refusal"
+    NODE_SUFFIX=".invalid" teardown_trio; return
+  fi
+  ROOT_PW="$new"
+  # The keyfile passes restart mongod member by member: an election may
+  # still be running when the last step answers.
+  wait_until 120 "a primary after the rotation" exactly_one_primary "$stay" "${reachable[@]}" \
+    || { bad "no primary after the rotation"; ROOT_PW="$real_root"; NODE_SUFFIX=".invalid" teardown_trio; return; }
+  primary="$(current_primary "$stay" "${reachable[@]}")"
+  if root_login_ok "$stay" "$primary" "$old" || ! root_login_ok "$stay" "$primary" "$new"; then
+    bad "after the rotation $primary does not accept exactly the new password"
+    ROOT_PW="$real_root"; NODE_SUFFIX=".invalid" teardown_trio; return
+  fi
+  ok "rotated on ${reachable[*]} while $away was away"
+  mongo "$primary" 'db.getSiblingDB("t").kv.insertOne({_id: 31, v: "while-away"}, {writeConcern: {w: "majority"}})' >/dev/null
+
+  [ "$mode" = "peers-paused" ] && docker pause "${reachable[@]}" >/dev/null
+  log "starting $away with the new password variables"
+  start_invalid_node "$(echo "$away" | sed -E 's/^mongo-([0-9]+).*/\1/')" -e MONGO_INITDB_ROOT_PASSWORD="$new" -e RS_KEY="$new" -e MEMBER_PRUNE_DWELL_SECONDS="$dwell"
+  if [ "$mode" = "peers-paused" ]; then
+    sleep 60
+    docker unpause "${reachable[@]}" >/dev/null
+    log "peers back"
+  fi
+
+  if ! wait_until 300 "$away back (3 healthy and voting)" set_is_fully_online "$stay"; then
+    bad "$away never rejoined the set after missing the rotation ($mode)"
+    ROOT_PW="$real_root"; NODE_SUFFIX=".invalid" teardown_trio; return
+  fi
+  ok "$away rejoined without a second redeploy ($mode)"
+  wait_until 120 "the write made while it was away reached $away" \
+    bash -c "[ \"\$(docker exec $away mongosh --quiet 'mongodb://$ROOT_USER:$new@127.0.0.1:27017/admin?directConnection=true' --eval 'db.getSiblingDB(\"t\").kv.findOne({_id: 31}).v' 2>/dev/null | tr -d '[:space:]')\" = while-away ]" \
+    && ok "the write made while $away was away arrived" \
+    || bad "the write made while $away was away never arrived"
+  if root_login_ok "$stay" "$away" "$new" && ! root_login_ok "$stay" "$away" "$old"; then
+    ok "$away accepts exactly the new password"
+  else
+    bad "$away does not accept exactly the new password"
+  fi
+  wait_until 90 "$away's pin follows the new password" \
+    bash -c "[ \"\$(docker exec $away cat /data/db/.railway-mongo-auth-pin 2>/dev/null | grep -o '\"password\":\"[^\"]*\"')\" = '\"password\":\"$new\"' ]" \
+    && ok "$away pins the new password" \
+    || bad "$away's pin is not the new password"
+  [ "$(rotate_call "$away" preflight "$new" "$new" "$new")" = "200" ] \
+    && ok "$away answers a later rotation's preflight" \
+    || bad "$away refuses a later rotation's preflight"
+  ROOT_PW="$real_root"
+  NODE_SUFFIX=".invalid" teardown_trio
+}
+
+t_returning_member_adopts_rotated_password() {
+  log "t_returning_member_adopts_rotated_password (still in the config)"
+  run_returning_member_case kept
+}
+
+t_pruned_member_adopts_rotated_password() {
+  log "t_pruned_member_adopts_rotated_password (pruned while away)"
+  run_returning_member_case pruned
+}
+
+t_returning_member_adopts_rotated_password_after_peers_return() {
+  log "t_returning_member_adopts_rotated_password_after_peers_return (no peer answers at boot)"
+  run_returning_member_case peers-paused
+}
+
 t_paused_member_is_not_pruned() {
   log "t_paused_member_is_not_pruned (fresh trio, short prune dwell)"
   teardown_trio
@@ -1719,6 +1894,9 @@ ALL_TESTS=(
   t_paused_member_is_not_pruned
   t_deleted_member_is_pruned
   t_pruned_member_redeploy_rejoins_with_data
+  t_returning_member_adopts_rotated_password
+  t_pruned_member_adopts_rotated_password
+  t_returning_member_adopts_rotated_password_after_peers_return
   t_revert_to_standalone_and_reconvert
   t_revert_after_crash_preserves_unflushed_writes
   t_standalone_boot_completes_fcv
