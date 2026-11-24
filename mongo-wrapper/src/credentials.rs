@@ -351,7 +351,7 @@ pub async fn reconcile(state: Arc<AppState>) {
     }
 }
 
-fn keys_overlap(left: &str, right: &str) -> bool {
+pub(crate) fn keys_overlap(left: &str, right: &str) -> bool {
     let keys = |text: &str| {
         serde_json::from_str::<Vec<String>>(text).unwrap_or_else(|_| vec![text.trim().into()])
     };
@@ -375,22 +375,26 @@ pub async fn reconcile_keyfile_at_boot(config: &crate::config::Config) -> anyhow
         return Ok(());
     }
     let mut candidates = vec![config.mongo_root_password.clone(), pin.password.clone()];
-    if let Some(request) = pending {
-        candidates.insert(0, request.current_password);
-        candidates.insert(0, request.new_password);
+    if let Some(request) = &pending {
+        candidates.insert(0, request.current_password.clone());
+        candidates.insert(0, request.new_password.clone());
     }
     let probe = async {
         for password in candidates {
             if let Some(keyfile) =
                 crate::rs::discover_live_set_keyfile_with_password(config, &password).await
             {
-                return Some(keyfile);
+                return Some((password, keyfile));
             }
         }
         None
     };
-    if let Ok(Some(keyfile)) = tokio::time::timeout(std::time::Duration::from_secs(20), probe).await
+    if let Ok(Some((password, keyfile))) =
+        tokio::time::timeout(std::time::Duration::from_secs(20), probe).await
     {
+        if pending.is_none() && password == config.mongo_root_password && password != pin.password {
+            crate::rotated_password::note_adopted(&password);
+        }
         if !keys_overlap(current, &keyfile) {
             pin.keyfile = Some(keyfile);
             write_pin(&config.data_dir, &pin)?;

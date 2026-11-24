@@ -42,6 +42,7 @@ mod passthrough;
 mod peers;
 mod process_manager;
 mod replication_monitor;
+mod rotated_password;
 mod rs;
 mod standalone_recovery;
 mod startup_dns;
@@ -290,6 +291,15 @@ async fn main() -> Result<()> {
         mongo.clone(),
         telemetry.clone(),
     ));
+
+    // A member that missed a rotation asks the set until it rejoins on the
+    // new credentials (see rotated_password).
+    if config.rs_enabled() {
+        tokio::spawn(rotated_password::adopt_rotated_password(
+            config.clone(),
+            mongo.clone(),
+        ));
+    }
 
     // Proves the boot credentials against the live server, writes the pin,
     // and follows a properly rotated password (see auth_pin::resolver).
